@@ -1,0 +1,372 @@
+// Package server wires the listeners, connections, and background workers
+// around the command layer. It is the only package that knows about sockets.
+package server
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"kestrel/command"
+	"kestrel/config"
+	"kestrel/engine"
+)
+
+// EffectLog receives the canonical effects of every write, in order.
+//
+// The append log and the replication backlog both implement it (M3 and M4);
+// until then the server installs a counting no-op, so that the propagation
+// path is exercised from the first milestone rather than being bolted on
+// once its bugs are expensive.
+type EffectLog interface {
+	Append(db int, args [][]byte)
+}
+
+// discardLog counts effects and throws them away.
+type discardLog struct{ count atomic.Int64 }
+
+func (d *discardLog) Append(db int, args [][]byte) { d.count.Add(1) }
+
+// Server is a running kestreld instance.
+type Server struct {
+	cfg   *config.Config
+	ks    *engine.Keyspace
+	table *command.Table
+	stats *command.Stats
+	log   *slog.Logger
+
+	startTime time.Time
+	effects   atomic.Pointer[EffectLog]
+
+	listeners []net.Listener
+	admin     *adminServer
+
+	clientsMu sync.Mutex
+	clients   map[uint64]*connection
+	nextID    atomic.Uint64
+
+	loading atomic.Bool
+	replica atomic.Bool
+
+	quit         chan struct{}
+	shutdownOnce sync.Once
+	shutdownErr  error
+	conns        sync.WaitGroup
+	workers      sync.WaitGroup
+}
+
+// New builds a server from a validated configuration.
+func New(cfg *config.Config) (*Server, error) {
+	snap := cfg.Snapshot()
+
+	table, err := command.NewTable(snap.RenamedCommands)
+	if err != nil {
+		return nil, err
+	}
+
+	ks := engine.New(engine.Options{
+		Databases:              snap.Databases,
+		Shards:                 snap.Shards,
+		MaxStringLength:        int(snap.ProtoMaxBulkLen),
+		ActiveExpire:           snap.ActiveExpire,
+		ActiveExpireSampleSize: snap.ActiveExpireSampleSize,
+		ActiveExpireCPUPercent: snap.ActiveExpireCPUPercent,
+		CachedClock:            true,
+	})
+
+	s := &Server{
+		cfg:       cfg,
+		ks:        ks,
+		table:     table,
+		stats:     command.NewStats(snap.SlowlogMaxLen),
+		log:       newLogger(snap.LogLevel, snap.LogFormat),
+		startTime: time.Now(),
+		clients:   make(map[uint64]*connection),
+		quit:      make(chan struct{}),
+	}
+	var el EffectLog = &discardLog{}
+	s.effects.Store(&el)
+
+	// Effects the engine produces on its own -- today only the DEL from a
+	// reaped key -- travel the same path as command effects (FR-3.4).
+	ks.SetEffectSink(effectSink{s})
+
+	// The GC is told the ceiling derived from maxmemory, so that pressure
+	// shows up as slower collection rather than as an OOM kill (ADR-013).
+	applyMemoryLimit(snap.MaxMemory, snap.MemoryLimitOverheadFactor, s.log)
+	if snap.GOGC > 0 {
+		debug.SetGCPercent(snap.GOGC)
+	}
+	return s, nil
+}
+
+type effectSink struct{ s *Server }
+
+func (e effectSink) Effect(db int, args ...[]byte) { e.s.Propagate(db, args...) }
+
+func applyMemoryLimit(maxMemory int64, factor float64, log *slog.Logger) {
+	if maxMemory <= 0 {
+		return
+	}
+	if factor < 1 {
+		factor = 1
+	}
+	limit := int64(float64(maxMemory) * factor)
+	debug.SetMemoryLimit(limit)
+	log.Info("soft memory limit applied",
+		"maxmemory", maxMemory, "overhead_factor", factor, "go_memory_limit", limit)
+}
+
+// Host interface (see command.Host).
+
+// Keyspace returns the data store.
+func (s *Server) Keyspace() *engine.Keyspace { return s.ks }
+
+// Config returns the live configuration.
+func (s *Server) Config() *config.Config { return s.cfg }
+
+// Commands returns the command table.
+func (s *Server) Commands() *command.Table { return s.table }
+
+// Stats returns the shared counters.
+func (s *Server) Stats() *command.Stats { return s.stats }
+
+// StartTime reports when the server began serving.
+func (s *Server) StartTime() time.Time { return s.startTime }
+
+// IsReplica reports whether this node follows a leader.
+func (s *Server) IsReplica() bool { return s.replica.Load() }
+
+// IsLoading reports whether the dataset is still being read from disk.
+func (s *Server) IsLoading() bool { return s.loading.Load() }
+
+// Logger returns the structured logger.
+func (s *Server) Logger() *slog.Logger { return s.log }
+
+// SetEffectLog installs the destination for write effects. The append log
+// (M3) and the replication backlog (M4) attach here.
+func (s *Server) SetEffectLog(l EffectLog) { s.effects.Store(&l) }
+
+// Propagate hands a canonical effect to the log and the replication stream.
+func (s *Server) Propagate(db int, args ...[]byte) {
+	if p := s.effects.Load(); p != nil {
+		(*p).Append(db, args)
+	}
+}
+
+// Shutdown asks the server to stop and returns once the listeners are closed.
+func (s *Server) Shutdown(save bool) error {
+	s.shutdownOnce.Do(func() {
+		s.log.Info("shutdown requested", "save", save)
+		close(s.quit)
+		for _, l := range s.listeners {
+			l.Close()
+		}
+	})
+	return s.shutdownErr
+}
+
+// Serve opens the listeners and blocks until the server is shut down or ctx
+// is cancelled.
+func (s *Server) Serve(ctx context.Context) error {
+	snap := s.cfg.Snapshot()
+
+	if snap.Port != 0 {
+		l, err := listen(snap.Bind, snap.Port, snap.TCPBacklog)
+		if err != nil {
+			return err
+		}
+		s.listeners = append(s.listeners, l)
+		s.log.Info("listening", "addr", l.Addr().String(), "tls", false)
+	}
+	if snap.TLSPort != 0 {
+		cfgTLS, err := buildTLSConfig(snap)
+		if err != nil {
+			return err
+		}
+		raw, err := listen(snap.Bind, snap.TLSPort, snap.TCPBacklog)
+		if err != nil {
+			return err
+		}
+		l := tls.NewListener(raw, cfgTLS)
+		s.listeners = append(s.listeners, l)
+		s.log.Info("listening", "addr", raw.Addr().String(), "tls", true)
+	}
+	if len(s.listeners) == 0 {
+		return errors.New("no listeners configured")
+	}
+
+	if snap.AdminPort != 0 {
+		s.admin = newAdminServer(s, snap)
+		if err := s.admin.start(); err != nil {
+			return err
+		}
+	}
+
+	s.warnIfExposed(snap)
+	s.warnIfNotDurable(snap)
+
+	for _, l := range s.listeners {
+		s.workers.Add(1)
+		go s.acceptLoop(l)
+	}
+
+	s.workers.Add(1)
+	go s.idleReaper()
+
+	select {
+	case <-ctx.Done():
+		s.Shutdown(true)
+	case <-s.quit:
+	}
+	return s.drain(snap)
+}
+
+// warnIfExposed says plainly when the server is reachable from off-box
+// without a password, rather than letting that be discovered later.
+func (s *Server) warnIfExposed(snap *config.Values) {
+	if snap.RequirePass != "" {
+		return
+	}
+	if snap.ProtectedMode {
+		s.log.Info("protected mode is on: connections from non-loopback addresses will be refused " +
+			"because no password is set")
+		return
+	}
+	if snap.Bind != "127.0.0.1" && snap.Bind != "localhost" && snap.Bind != "::1" {
+		s.log.Warn("server is bound to a non-loopback address with no password and protected mode off",
+			"bind", snap.Bind)
+	}
+}
+
+// warnIfNotDurable says, at every startup, that this build keeps nothing.
+//
+// The configuration accepts appendonly and snapshot-interval so that a
+// production config file loads unchanged, but the append log and the
+// snapshotter are M3 work and do not exist yet. An operator who reads
+// "appendonly yes" in their config and assumes their data survives a restart
+// would be wrong, and finding that out from a restart is the worst possible
+// way to learn it.
+func (s *Server) warnIfNotDurable(snap *config.Values) {
+	if snap.AppendOnly || snap.SnapshotInterval > 0 {
+		s.log.Warn("PERSISTENCE IS NOT IMPLEMENTED IN THIS BUILD: the append log and " +
+			"snapshots arrive in M3. Data is held in memory only and is lost on restart, " +
+			"regardless of the appendonly and snapshot-interval settings.")
+		return
+	}
+	s.log.Info("persistence is disabled; data is held in memory only")
+}
+
+// drain implements the graceful shutdown sequence of NFR-3: stop accepting,
+// let in-flight commands finish, flush and sync durable state, then exit.
+func (s *Server) drain(snap *config.Values) error {
+	timeout := 30 * time.Second
+	deadline := time.Now().Add(timeout)
+
+	for _, l := range s.listeners {
+		l.Close()
+	}
+	if s.admin != nil {
+		s.admin.stop()
+	}
+
+	s.unblockClients()
+
+	done := make(chan struct{})
+	go func() {
+		s.conns.Wait()
+		s.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Until(deadline)):
+		s.log.Warn("shutdown timed out waiting for connections to drain", "timeout", timeout)
+	}
+
+	s.ks.Close()
+	s.log.Info("shutdown complete",
+		"uptime_seconds", int64(time.Since(s.startTime).Seconds()))
+	return nil
+}
+
+// unblockClients wakes every connection that is parked in a read so that it
+// notices the closed quit channel and returns.
+//
+// It deliberately does not touch Client.CloseAfterReply: that field belongs
+// to the connection's own goroutine, and writing it from here would be a
+// data race on state the command layer assumes is single-threaded.
+func (s *Server) unblockClients() {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	for _, c := range s.clients {
+		c.nc.SetReadDeadline(time.Now())
+	}
+}
+
+func listen(bind string, port, backlog int) (net.Listener, error) {
+	addr := net.JoinHostPort(bind, fmt.Sprint(port))
+	lc := net.ListenConfig{}
+	l, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listening on %s: %w", addr, err)
+	}
+	return l, nil
+}
+
+func buildTLSConfig(snap *config.Values) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(snap.TLSCertFile, snap.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading TLS key pair: %w", err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if snap.TLSCACertFile != "" {
+		pem, err := os.ReadFile(snap.TLSCACertFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading TLS CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("TLS CA file contains no usable certificates")
+		}
+		cfg.ClientCAs = pool
+	}
+	if snap.TLSAuthClients {
+		if cfg.ClientCAs == nil {
+			return nil, errors.New("tls-auth-clients requires tls-ca-cert-file")
+		}
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
+}
+
+func newLogger(level, format string) *slog.Logger {
+	var lv slog.Level
+	switch level {
+	case "debug":
+		lv = slog.LevelDebug
+	case "warn":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	default:
+		lv = slog.LevelInfo
+	}
+	opts := &slog.HandlerOptions{Level: lv}
+	if format == "text" {
+		return slog.New(slog.NewTextHandler(os.Stderr, opts))
+	}
+	return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+}

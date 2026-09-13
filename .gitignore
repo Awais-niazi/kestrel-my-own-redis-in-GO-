@@ -1,0 +1,14 @@
+# Compiled binaries and build output. These are rebuilt from source on every
+# `make build`, so committing them adds a fresh multi-megabyte blob to the
+# history for no benefit.
+/bin/
+/kestrel/build/
+*.test
+*.out
+*.exe
+
+# Go toolchain scratch (module cache / checksum database mirror).
+/pkg/
+
+# Fuzzing corpus additions are machine-specific; seeds live in the test file.
+testdata/fuzz/
