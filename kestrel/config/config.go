@@ -58,8 +58,10 @@ type Values struct {
 	HashMaxListpackEntries int
 	HashMaxListpackValue   int
 	ListMaxListpackSize    int
+	ListMaxListpackValue   int
 	SetMaxIntsetEntries    int
 	SetMaxListpackEntries  int
+	SetMaxListpackValue    int
 	ZsetMaxListpackEntries int
 	ZsetMaxListpackValue   int
 
@@ -149,8 +151,10 @@ func DefaultValues() Values {
 		HashMaxListpackEntries: 128,
 		HashMaxListpackValue:   64,
 		ListMaxListpackSize:    128,
+		ListMaxListpackValue:   64,
 		SetMaxIntsetEntries:    512,
 		SetMaxListpackEntries:  128,
+		SetMaxListpackValue:    64,
 		ZsetMaxListpackEntries: 128,
 		ZsetMaxListpackValue:   64,
 

@@ -33,6 +33,9 @@ type Host interface {
 	IsLoading() bool
 	// StartTime is when the process began serving.
 	StartTime() time.Time
+	// ApplyRuntimeConfig re-reads the configuration into the subsystems
+	// that cache parts of it, after a CONFIG SET.
+	ApplyRuntimeConfig()
 }
 
 // Ctx carries one command execution.

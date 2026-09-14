@@ -380,7 +380,15 @@ func TestServerCommands(t *testing.T) {
 	if v := s.do("CONFIG", "GET", "maxmemory"); str(v) != "[maxmemory 100000000]" {
 		t.Fatalf("a rejected batch was partially applied: %s", str(v))
 	}
+	// RESETSTAT clears the keyspace counters as well as the command ones.
+	s.do("GET", "no-such-key")
+	if before := h.ks.Stats(); before.Misses == 0 {
+		t.Fatal("a miss was not counted")
+	}
 	s.expect("OK", "CONFIG", "RESETSTAT")
+	if after := h.ks.Stats(); after.Misses != 0 || after.Hits != 0 {
+		t.Fatalf("CONFIG RESETSTAT left keyspace counters at %+v", after)
+	}
 
 	if v := s.do("TIME"); len(v.Elems) != 2 {
 		t.Fatalf("TIME = %s", str(v))

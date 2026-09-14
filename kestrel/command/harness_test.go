@@ -37,6 +37,12 @@ type effect struct {
 
 func (e effect) String() string { return strings.Join(e.args, " ") }
 
+// kindMap and kindNull name reply kinds in assertions without importing the
+// protocol constants into every test file.
+func kindMap() resp.Kind  { return resp.KindMap }
+func kindNull() resp.Kind { return resp.KindNull }
+func kindSet() resp.Kind  { return resp.KindSet }
+
 // farFuture is a deadline the expiry pass will never hit, so a test pass
 // runs to completion.
 func farFuture() time.Time { return time.Now().Add(time.Hour) }
@@ -64,6 +70,7 @@ func newTestHost(t *testing.T, tweaks ...func(*config.Config)) *testHost {
 	t.Cleanup(ks.Close)
 
 	h := &testHost{cfg: cfg, ks: ks, table: table, stats: NewStats(128), start: time.Now()}
+	h.ApplyRuntimeConfig()
 	h.now.Store(1_700_000_000_000)
 	ks.SetClock(func() int64 { return h.now.Load() })
 	ks.SetEffectSink(hostSink{h})
@@ -82,6 +89,22 @@ func (h *testHost) Shutdown(bool) error        { return nil }
 func (h *testHost) IsReplica() bool            { return false }
 func (h *testHost) IsLoading() bool            { return false }
 func (h *testHost) StartTime() time.Time       { return h.start }
+
+func (h *testHost) ApplyRuntimeConfig() {
+	snap := h.cfg.Snapshot()
+	h.stats.Slowlog.SetCapacity(snap.SlowlogMaxLen)
+	h.ks.SetThresholds(engine.Thresholds{
+		HashMaxListpackEntries: snap.HashMaxListpackEntries,
+		HashMaxListpackValue:   snap.HashMaxListpackValue,
+		ListMaxListpackSize:    snap.ListMaxListpackSize,
+		ListMaxListpackValue:   snap.ListMaxListpackValue,
+		SetMaxIntsetEntries:    snap.SetMaxIntsetEntries,
+		SetMaxListpackEntries:  snap.SetMaxListpackEntries,
+		SetMaxListpackValue:    snap.SetMaxListpackValue,
+		ZSetMaxListpackEntries: snap.ZsetMaxListpackEntries,
+		ZSetMaxListpackValue:   snap.ZsetMaxListpackValue,
+	})
+}
 func (h *testHost) Info(sections []string) string {
 	return "# Server\r\nkestrel_version:" + Version + "\r\n"
 }

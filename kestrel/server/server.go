@@ -81,6 +81,7 @@ func New(cfg *config.Config) (*Server, error) {
 		ActiveExpireSampleSize: snap.ActiveExpireSampleSize,
 		ActiveExpireCPUPercent: snap.ActiveExpireCPUPercent,
 		CachedClock:            true,
+		Encoding:               encodingThresholds(snap),
 	})
 
 	s := &Server{
@@ -107,6 +108,31 @@ func New(cfg *config.Config) (*Server, error) {
 		debug.SetGCPercent(snap.GOGC)
 	}
 	return s, nil
+}
+
+// encodingThresholds maps the configuration onto the engine's promotion
+// thresholds (ADR-006).
+func encodingThresholds(snap *config.Values) engine.Thresholds {
+	return engine.Thresholds{
+		HashMaxListpackEntries: snap.HashMaxListpackEntries,
+		HashMaxListpackValue:   snap.HashMaxListpackValue,
+		ListMaxListpackSize:    snap.ListMaxListpackSize,
+		ListMaxListpackValue:   snap.ListMaxListpackValue,
+		SetMaxIntsetEntries:    snap.SetMaxIntsetEntries,
+		SetMaxListpackEntries:  snap.SetMaxListpackEntries,
+		SetMaxListpackValue:    snap.SetMaxListpackValue,
+		ZSetMaxListpackEntries: snap.ZsetMaxListpackEntries,
+		ZSetMaxListpackValue:   snap.ZsetMaxListpackValue,
+	}
+}
+
+// ApplyRuntimeConfig pushes configuration that other subsystems cache. The
+// CONFIG SET handler calls it so that a threshold change takes effect
+// immediately rather than at the next restart.
+func (s *Server) ApplyRuntimeConfig() {
+	snap := s.cfg.Snapshot()
+	s.stats.Slowlog.SetCapacity(snap.SlowlogMaxLen)
+	s.ks.SetThresholds(encodingThresholds(snap))
 }
 
 type effectSink struct{ s *Server }

@@ -9,15 +9,15 @@ distribution and is not affiliated with Redis Ltd.
 
 ## Status
 
-**M0 (skeleton) and M1 (core key/value) are complete.** The server runs, real
-Redis clients talk to it, and strings, generic keyspace commands, and
-expiration all work.
+**M0 (skeleton), M1 (core key/value) and M2 (collections) are complete.** The
+server runs, real Redis clients talk to it, and strings, lists, hashes, sets,
+sorted sets, generic keyspace commands, and expiration all work.
 
 | Milestone | Scope | State |
 |---|---|---|
 | M0 | RESP2 codec, TCP/TLS server, connection handling, config, fuzz harness | done |
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
-| M2 | Lists, hashes, sets, sorted sets, adaptive encodings | not started |
+| M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
 | M3 | Append log, snapshots, recovery, compaction | not started |
 | M4 | Replication | not started |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
@@ -70,6 +70,27 @@ RESP3) `QUIT` `RESET` `CLIENT ID|GETNAME|SETNAME|INFO|NO-EVICT|HELP`
 `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `APPEND` `STRLEN` `GETRANGE`
 `SETRANGE` `SUBSTR`
 
+**Lists** `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LRANGE` `LLEN`
+`LINDEX` `LSET` `LINSERT` `LREM` `LTRIM` `LPOS` `LMOVE` `RPOPLPUSH`
+
+**Hashes** `HSET` `HSETNX` `HGET` `HMGET` `HMSET` `HDEL` `HLEN` `HKEYS`
+`HVALS` `HGETALL` `HEXISTS` `HINCRBY` `HINCRBYFLOAT` `HSTRLEN` `HRANDFIELD`
+`HSCAN`
+
+**Sets** `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SPOP`
+`SRANDMEMBER` `SMOVE` `SINTER` `SUNION` `SDIFF` `SINTERSTORE` `SUNIONSTORE`
+`SDIFFSTORE` `SINTERCARD` `SSCAN`
+
+**Sorted sets** `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZREM` `ZSCORE`
+`ZMSCORE` `ZINCRBY` `ZCARD` `ZCOUNT` `ZLEXCOUNT` `ZRANGE` (`BYSCORE` `BYLEX`
+`REV` `LIMIT` `WITHSCORES`) `ZRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGE`
+`ZREVRANGEBYSCORE` `ZREVRANGEBYLEX` `ZRANGESTORE` `ZRANK` `ZREVRANK`
+`ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX`
+`ZUNION` `ZINTER` `ZDIFF` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE`
+`ZINTERCARD` `ZRANDMEMBER` `ZSCAN`
+
+**Generic** `SORT` `SORT_RO` (without `BY` and `GET` patterns)
+
 **Keyspace** `DEL` `UNLINK` `EXISTS` `TOUCH` `TYPE` `RENAME` `RENAMENX`
 `COPY` `KEYS` `SCAN` `RANDOMKEY` `DBSIZE` `EXPIRE` `PEXPIRE` `EXPIREAT`
 `PEXPIREAT` (each with `NX` `XX` `GT` `LT`) `TTL` `PTTL` `EXPIRETIME`
@@ -89,8 +110,8 @@ decision that excluded them and are counted in
 `unsupported_command_attempts`, so the compatibility backlog is driven by
 real traffic rather than guesswork.
 
-Collection types (`LPUSH`, `HSET`, `SADD`, `ZADD`, …) are M2 and currently
-return "unknown command".
+The blocking variants (`BLPOP`, `BZPOPMIN`, `BLMOVE`, `LMPOP`) are M5, along
+with pub/sub and transactions.
 
 See [docs/deviations.md](docs/deviations.md) for the places where behaviour
 intentionally differs from the reference implementation.
@@ -135,10 +156,32 @@ replies are built once. `TestGetReadPathAllocations` fails the build if a
 than editing one in place, which is what makes it safe to hand a caller a
 slice that points into the keyspace.
 
+**Collections carry two encodings each.** Small ones live in a listpack: a
+single contiguous buffer with length-prefixed entries, so a hundred-field
+hash is one pointer for the garbage collector rather than two hundred. Above
+the configured thresholds a hash becomes a map, a list becomes a quicklist of
+bounded listpack nodes, a set becomes an intset or a map, and a sorted set
+becomes a skiplist paired with a member map. Promotion is one-way, because a
+workload oscillating around a threshold would otherwise rebuild the
+collection on every operation.
+
 **Expiry is approximate, deliberately.** Lazy expiry on access plus a
 background cycle that samples the TTL index under a CPU budget. On a replica
 expired keys are hidden from reads but never deleted locally: the leader's
 `DEL` is authoritative, so the two cannot diverge on their own clocks.
+
+## Conformance
+
+Beyond the unit and property tests, the collection commands are checked
+against a real `redis-server` on the same machine: an identical stream of 154
+commands runs against both and every reply is compared. Two differences
+remain, both because the reference available here is 7.0.15 and the target is
+7.2:
+
+- `OBJECT ENCODING` reports `listpack` for a small non-integer set, which is
+  7.2 behaviour and what §6.2 of the PRD specifies. 7.0 has no listpack set
+  and reports `hashtable`.
+- `ZRANK ... WITHSCORE` exists here and was added upstream in 7.2.
 
 ## Performance
 

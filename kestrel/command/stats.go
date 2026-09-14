@@ -127,13 +127,6 @@ func (l *Slowlog) Reset() {
 	l.entries = nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

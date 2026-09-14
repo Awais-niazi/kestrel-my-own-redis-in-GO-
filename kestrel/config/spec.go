@@ -143,6 +143,10 @@ func init() {
 	register("list-max-listpack-size", true, num(func(c *Values) *int { return &c.ListMaxListpackSize }))
 	register("set-max-intset-entries", true, num(func(c *Values) *int { return &c.SetMaxIntsetEntries }))
 	register("set-max-listpack-entries", true, num(func(c *Values) *int { return &c.SetMaxListpackEntries }))
+	// Appendix B lists no value limit for sets or lists, but the encoding
+	// table in §6.2 specifies one for both, so they are configurable here.
+	register("set-max-listpack-value", true, num(func(c *Values) *int { return &c.SetMaxListpackValue }))
+	register("list-max-listpack-value", true, num(func(c *Values) *int { return &c.ListMaxListpackValue }))
 	register("zset-max-listpack-entries", true, num(func(c *Values) *int { return &c.ZsetMaxListpackEntries }))
 	register("zset-max-listpack-value", true, num(func(c *Values) *int { return &c.ZsetMaxListpackValue }))
 

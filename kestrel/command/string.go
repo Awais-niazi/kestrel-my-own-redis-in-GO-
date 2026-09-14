@@ -391,16 +391,7 @@ func cmdGetEx(c *Ctx) resp.Value {
 }
 
 func cmdMGet(c *Ctx) resp.Value {
-	vals := c.DB().MGet(c.Tail(1))
-	out := make([]resp.Value, len(vals))
-	for i, v := range vals {
-		if v == nil {
-			out[i] = resp.Null()
-		} else {
-			out[i] = resp.Bulk(v)
-		}
-	}
-	return resp.ArrayOf(out)
+	return bulkArrayWithNils(c.DB().MGet(c.Tail(1)))
 }
 
 func cmdMSet(c *Ctx) resp.Value {

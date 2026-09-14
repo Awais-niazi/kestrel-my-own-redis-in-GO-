@@ -72,6 +72,9 @@ type Options struct {
 	ActiveExpireSampleSize int
 	// ActiveExpireCPUPercent bounds the expiry cycle's duty cycle.
 	ActiveExpireCPUPercent int
+	// Encoding holds the thresholds at which collections are promoted from
+	// their compact encoding to their full one (ADR-006).
+	Encoding Thresholds
 	// CachedClock replaces the per-call time.Now with an atomic read of a
 	// value refreshed every millisecond by a background goroutine.
 	//
@@ -92,6 +95,7 @@ func DefaultOptions() Options {
 		ActiveExpire:           true,
 		ActiveExpireSampleSize: 20,
 		ActiveExpireCPUPercent: 25,
+		Encoding:               DefaultThresholds(),
 	}
 }
 
@@ -117,6 +121,7 @@ func (o *Options) normalize() {
 	if o.ActiveExpireCPUPercent <= 0 || o.ActiveExpireCPUPercent > 100 {
 		o.ActiveExpireCPUPercent = 25
 	}
+	o.Encoding.normalize()
 }
 
 // Stats is a point-in-time reading of the engine counters exported through
@@ -148,6 +153,7 @@ type Keyspace struct {
 	sink    atomic.Pointer[EffectSink]
 	watcher atomic.Pointer[KeyWatcher]
 	replica atomic.Bool
+	limits  limitsHolder
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -158,6 +164,7 @@ type Keyspace struct {
 func New(opts Options) *Keyspace {
 	opts.normalize()
 	ks := &Keyspace{opts: opts, stop: make(chan struct{})}
+	ks.SetThresholds(opts.Encoding)
 	var c Clock = systemClock
 	ks.clock.Store(&c)
 	ks.dbs = make([]*DB, opts.Databases)

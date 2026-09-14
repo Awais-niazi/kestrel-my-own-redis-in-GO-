@@ -28,7 +28,17 @@ ADR-004 flags and Q2 asks about.
   `shards` requires a restart anyway.
 - Total work across a full iteration is O(n), the same as the reference.
 
-`HSCAN`, `SSCAN` and `ZSCAN` land with the collection types in M2.
+### HSCAN, SSCAN and ZSCAN
+
+These return the whole collection in one call with a zero cursor. That is
+what the reference implementation does for the compact encodings, and this
+implementation extends it to the promoted ones for the same reason as above:
+Go's map exposes no stable iteration order, so a resumable cursor over a
+promoted hash or set cannot be built on it. `COUNT` is accepted and ignored.
+
+For a listpack-encoded collection, which is the common case, the behaviour is
+identical to the reference. For a very large hash or set the reply is large,
+in the same way `HGETALL` on such a key is already large.
 
 ## INCRBYFLOAT rendering
 
@@ -75,6 +85,23 @@ reading the documentation.
 
 The practical consequence is that `maxmemory` should be set to 60-70% of the
 container limit, not the 90% that is reasonable for a C implementation.
+
+## SORT does not support BY and GET
+
+`SORT key [LIMIT offset count] [ASC|DESC] [ALPHA] [STORE dst]` works.
+`SORT ... BY pattern` and `SORT ... GET pattern` return an explicit
+unsupported error rather than being ignored, because a client that asks for a
+pattern sort and silently receives an unsorted answer is worse off than one
+that gets an error. Appendix A records this as a v1 limitation.
+
+`SORT_RO` is provided as the read-only variant.
+
+## Set encodings follow Redis 7.2, not 7.0
+
+A small set of non-integer members uses the listpack encoding, as the
+encoding table in §6.2 of the PRD specifies. Redis 7.0 and earlier have no
+listpack set and report `hashtable` for the same data. `OBJECT ENCODING`
+therefore differs from a 7.0 server, and matches a 7.2 one.
 
 ## No RDB or AOF file compatibility
 

@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"kestrel/config"
 	"kestrel/resp"
 )
 
@@ -308,19 +307,16 @@ func cmdConfigSet(c *Ctx) resp.Value {
 			return resp.Err("ERR CONFIG SET failed - " + err.Error())
 		}
 	}
-	applyRuntimeConfig(c.Host, cfg)
+	c.Host.ApplyRuntimeConfig()
 	return resp.OK()
-}
-
-// applyRuntimeConfig pushes the parameters that other subsystems cache.
-func applyRuntimeConfig(host Host, cfg *config.Config) {
-	snap := cfg.Snapshot()
-	host.Stats().Slowlog.SetCapacity(snap.SlowlogMaxLen)
 }
 
 func cmdConfigResetStat(c *Ctx) resp.Value {
 	c.Host.Stats().Reset()
 	c.Host.Commands().ResetCommandStats()
+	// The keyspace hit, miss and eviction counters are part of what INFO
+	// stats reports, so they reset with everything else.
+	c.Host.Keyspace().ResetStats()
 	return resp.OK()
 }
 

@@ -134,9 +134,6 @@ func cloneObject(o *Object) *Object {
 	return &c
 }
 
-// Touch counts how many of keys exist, updating their access recency.
-func (db *DB) Touch(keys [][]byte) int64 { return db.Exists(keys) }
-
 // RandomKey returns a random live key, or nil when the database is empty.
 func (db *DB) RandomKey() []byte {
 	db.ks.barrier.RLock()
