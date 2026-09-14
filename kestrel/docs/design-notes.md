@@ -242,3 +242,61 @@ This was worth doing early. Every write command has had to answer "how do you
 replicate?" from the first one written, which is the mitigation R5 asks for,
 and M3 and M4 attach to a propagation path that is already exercised rather
 than introducing one late and discovering its bugs under a fsync workload.
+
+---
+
+## 7. What `appendfsync` actually costs, and where the append log contends
+
+Measured on the development host (Intel i7-8665U, ext4 on NVMe), one
+`SET key value` record:
+
+| `appendfsync` | ns/op | effective ceiling | allocations |
+|---|---|---|---|
+| `no` | 1055 | ~950k writes/s | 0 |
+| `everysec` | 1343 | ~745k writes/s | 0 |
+| `always` | 4,575,000 | **~220 writes/s** | 0 |
+
+Two things worth stating plainly.
+
+**`always` is four orders of magnitude slower**, not a percentage slower. It
+is a correct implementation of the durability contract -- an acknowledged
+write is on stable storage -- and that contract costs a disk revolution or a
+flash program per command, because each append is forced on its own. The
+number belongs in the operator documentation next to the directive, because
+"slower" does not prepare anyone for 220 writes a second.
+
+**The log is a contention point.** `BenchmarkAppendParallel` runs 4376 ns/op
+against 1343 serial: eight goroutines appending are three times *slower* per
+operation than one. The `write(2)` happens under the log mutex, so
+concurrency turns into queueing at a syscall.
+
+Both have the same fix, which is deliberately not in this chunk: **group
+commit.** Batch the records that arrive while a write or an fsync is in
+flight, and issue one `write` and one `fsync` for the batch. Under `always`
+the batch amortizes the fsync across every client waiting on it, which is
+where the four orders of magnitude come back; under `everysec` it collapses
+the syscall queue.
+
+It is not in this chunk because it is an optimization with a correctness
+surface -- a batch that reports success to a client whose record was in a
+failed write is a lie about durability -- and it should be built against a
+recovery path that can prove it, which is chunk C. The numbers above are the
+baseline it has to beat.
+
+### Why the log does not reuse the `resp` package
+
+A record payload is a RESP2 array, but `persist` encodes it with twenty lines
+of its own rather than importing `resp`. A connection's writer switches
+dialect when a client sends `HELLO 3`, and a log whose encoding could follow
+a client's protocol negotiation would be a file whose meaning depends on who
+happened to be connected when it was written. The duplication is the point:
+the log's dialect is fixed at RESP2 and cannot drift with the wire protocol.
+
+### Stream offsets run across files
+
+A record's offset is its position in the *stream*, not in the file. A rewrite
+starts a new file whose header carries the offset the previous log reached,
+so an offset a snapshot recorded before a compaction still names the same
+point afterwards. Restarting the counter per file would invalidate every
+snapshot anchor on the first rewrite, which is the moment those anchors
+matter most.

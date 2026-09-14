@@ -18,7 +18,7 @@ sorted sets, generic keyspace commands, and expiration all work.
 | M0 | RESP2 codec, TCP/TLS server, connection handling, config, fuzz harness | done |
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
-| M3 | Append log, snapshots, recovery, compaction | not started |
+| M3 | Append log, snapshots, recovery, compaction | in progress: append log written, not yet wired |
 | M4 | Replication | not started |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
@@ -27,9 +27,11 @@ sorted sets, generic keyspace commands, and expiration all work.
 ### Nothing is durable yet
 
 The configuration accepts `appendonly` and `snapshot-interval` so that a
-production config file loads unchanged, but **the append log and the
-snapshotter do not exist yet**. Data lives in memory only and is lost on
-restart. The server says so in its startup log, every time.
+production config file loads unchanged, and the append log itself now exists
+in `persist/`, but **nothing is written to it yet**: the server does not open
+a log, and there is no recovery path. Data lives in memory only and is lost
+on restart. The server says so in its startup log, every time, and will keep
+saying so until recovery lands.
 
 The effect stream those subsystems will consume is already built and tested,
 so M3 attaches to a working propagation path rather than introducing one.
