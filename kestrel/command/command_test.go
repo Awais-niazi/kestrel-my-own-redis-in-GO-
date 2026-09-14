@@ -70,6 +70,24 @@ func TestConnectionCommands(t *testing.T) {
 	s.expect("OK", "CLIENT", "SETNAME", "worker-1")
 	s.expect("worker-1", "CLIENT", "GETNAME")
 	s.expectErrPrefix("ERR Client names", "CLIENT", "SETNAME", "has space")
+	// CLIENT INFO is a space-separated field list with no trailing space,
+	// and clients parse it, so its shape is pinned.
+	info := str(s.do("CLIENT", "INFO"))
+	if strings.HasSuffix(info, " ") || strings.Contains(info, "  ") {
+		t.Errorf("CLIENT INFO spacing is wrong: %q", info)
+	}
+	for _, want := range []string{
+		"id=1", "addr=127.0.0.1:1234", "laddr=127.0.0.1:6380",
+		"name=worker-1", "db=5", "resp=2", "cmd=client|info", "user=default",
+	} {
+		if !strings.Contains(info, want) {
+			t.Errorf("CLIENT INFO is missing %q; got %q", want, info)
+		}
+	}
+	if fields := strings.Fields(info); len(fields) != 8 {
+		t.Errorf("CLIENT INFO has %d fields, want 8: %q", len(fields), info)
+	}
+
 	s.expect("RESET", "RESET")
 	if s.cl.DBIndex != 0 || s.cl.Name != "" {
 		t.Fatal("RESET did not restore the default state")

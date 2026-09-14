@@ -260,15 +260,32 @@ func cmdClientInfo(c *Ctx) resp.Value { return resp.BulkString(clientInfoLine(c)
 func clientInfoLine(c *Ctx) string {
 	cl := c.Client
 	var b strings.Builder
-	b.WriteString("id=" + strconv.FormatUint(cl.ID, 10))
-	b.WriteString(" addr=" + cl.Addr)
-	b.WriteString(" laddr=" + cl.LocalAddr)
-	b.WriteString(" name=" + cl.Name)
-	b.WriteString(" db=" + strconv.Itoa(cl.DBIndex))
-	b.WriteString(" resp=" + strconv.Itoa(cl.Protocol()))
-	b.WriteString(" cmd=" + strings.ToLower(cl.LastCommand()))
-	b.WriteString(" user=" + cl.User)
+	b.Grow(160)
+	writeField(&b, "id", strconv.FormatUint(cl.ID, 10))
+	writeField(&b, "addr", cl.Addr)
+	writeField(&b, "laddr", cl.LocalAddr)
+	writeField(&b, "name", cl.Name)
+	writeField(&b, "db", strconv.Itoa(cl.DBIndex))
+	writeField(&b, "resp", strconv.Itoa(cl.Protocol()))
+	writeField(&b, "cmd", strings.ToLower(cl.LastCommand()))
+	writeField(&b, "user", cl.User)
 	return b.String()
+}
+
+// writeField appends one "name=value" field, separated from any preceding
+// field by a space.
+//
+// The parts go into the builder one at a time rather than being joined with
+// '+' first: concatenating before the call allocates a throwaway string per
+// field, which is the cost a Builder exists to avoid. CLIENT LIST reuses
+// this when it lands in M6, once per connection per call.
+func writeField(b *strings.Builder, name, value string) {
+	if b.Len() > 0 {
+		b.WriteByte(' ')
+	}
+	b.WriteString(name)
+	b.WriteByte('=')
+	b.WriteString(value)
 }
 
 func cmdClientNoEvict(c *Ctx) resp.Value {

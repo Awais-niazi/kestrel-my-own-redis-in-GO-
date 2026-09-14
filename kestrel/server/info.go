@@ -81,7 +81,9 @@ func header(b *strings.Builder, name string) {
 	if b.Len() > 0 {
 		b.WriteString("\r\n")
 	}
-	b.WriteString("# " + name + "\r\n")
+	b.WriteString("# ")
+	b.WriteString(name)
+	b.WriteString("\r\n")
 }
 
 func kv(b *strings.Builder, k string, v any) {
