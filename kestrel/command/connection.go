@@ -37,6 +37,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "SWAPDB", Arity: 3, Flags: Write | Fast, Effect: EffectVerbatim,
+		Locality:   LocalityCrossShard,
 		Categories: []string{"keyspace", "dangerous"},
 		Summary:    "Swaps two databases.",
 		Handler:    cmdSwapDB,

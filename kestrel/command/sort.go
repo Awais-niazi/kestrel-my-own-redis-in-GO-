@@ -12,6 +12,7 @@ import (
 func init() {
 	register(&Descriptor{
 		Name: "SORT", Arity: -2, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "list", "set", "sortedset", "slow", "dangerous"},
 		Summary: "Sorts the elements in a list, a set, or a sorted set, " +

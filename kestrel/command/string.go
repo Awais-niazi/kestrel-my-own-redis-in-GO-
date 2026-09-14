@@ -49,42 +49,49 @@ func init() {
 		Categories: []string{"write", "string", "slow"},
 		Summary:    "Sets the string value of a key, ignoring its type.",
 		Handler:    cmdSet, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "SETNX", Arity: 3, Flags: Write | DenyOOM | Fast, FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "fast"},
 		Summary:    "Sets the value of a key only when the key doesn't exist.",
 		Handler:    cmdSetNX, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "SETEX", Arity: 4, Flags: Write | DenyOOM, FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "slow"},
 		Summary:    "Sets the value and expiration time of a key.",
 		Handler:    cmdSetEx, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "PSETEX", Arity: 4, Flags: Write | DenyOOM, FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "slow"},
 		Summary:    "Sets the value and expiration in milliseconds of a key.",
 		Handler:    cmdSetEx, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "GETSET", Arity: 3, Flags: Write | DenyOOM | Fast, FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "fast"},
 		Summary:    "Returns the previous string value of a key after setting it.",
 		Handler:    cmdGetSet, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "GETDEL", Arity: 2, Flags: Write | Fast, FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "fast"},
 		Summary:    "Returns the string value of a key after deleting it.",
 		Handler:    cmdGetDel, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "GETEX", Arity: -2, Flags: Write | Fast, FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "fast"},
 		Summary:    "Returns the string value of a key after setting its expiration time.",
 		Handler:    cmdGetEx, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "MGET", Arity: -2, Flags: Readonly | Fast, FirstKey: 1, LastKey: -1, Step: 1,
@@ -94,6 +101,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "MSET", Arity: -3, Flags: Write | DenyOOM, Effect: EffectVerbatim, FirstKey: 1, LastKey: -1, Step: 2,
+		Locality:   LocalityShardLocal,
 		Categories: []string{"write", "string", "slow"},
 		Summary:    "Sets the string values of one or more keys.",
 		Handler:    cmdMSet,
@@ -103,6 +111,7 @@ func init() {
 		Categories: []string{"write", "string", "slow"},
 		Summary:    "Sets the string values of one or more keys, only when none of them exist.",
 		Handler:    cmdMSetNX, Effect: EffectCanonical,
+		Locality: LocalityCrossShard,
 	})
 	for _, spec := range []struct {
 		name    string
@@ -124,6 +133,7 @@ func init() {
 			// logged verbatim (ADR-008). The per-shard offset filter in the
 			// recovery path is what makes "consistent base" true (§7.3).
 			Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"write", "string", "fast"},
 			Summary:    spec.summary,
@@ -135,9 +145,11 @@ func init() {
 		Categories: []string{"write", "string", "fast"},
 		Summary:    "Increments the floating point value of a key by a number.",
 		Handler:    cmdIncrByFloat, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 	})
 	register(&Descriptor{
 		Name: "APPEND", Arity: 3, Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "fast"},
 		Summary:    "Appends a string to the value of a key.",
@@ -157,6 +169,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "SETRANGE", Arity: 4, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "string", "slow"},
 		Summary:    "Overwrites part of a string value at a key.",

@@ -3,6 +3,7 @@ package command
 import (
 	"time"
 
+	"kestrel/config"
 	"kestrel/resp"
 )
 
@@ -28,17 +29,41 @@ func Execute(host Host, cl *Client, args [][]byte) {
 	*ctx = Ctx{Host: host, Client: cl, Cmd: d, Args: args}
 	cl.setLastCommand(d)
 
+	cfg := host.Config().Snapshot()
+
+	// A cross-shard read-modify-write command must not have its effect land
+	// inside a snapshot window, so the guard spans the handler and the
+	// propagation together: it is the effect's log offset that has to fall
+	// outside the window. See Keyspace.SnapshotWindow.
+	//
+	// It is released before the reply is written, because that write can
+	// block on a slow client and a snapshot must not wait for one.
+	if d.Locality == LocalityCrossShard {
+		ks := host.Keyspace()
+		ks.BeginCrossShard()
+		result := runAndPropagate(host, cl, ctx, d, args, cfg)
+		ks.EndCrossShard()
+		cl.Out.WriteValue(result)
+		return
+	}
+	cl.Out.WriteValue(runAndPropagate(host, cl, ctx, d, args, cfg))
+}
+
+// runAndPropagate executes the handler, records its cost and hands its
+// effect to the propagation path. It returns the reply rather than writing
+// it, so that the caller can drop any lock it holds first.
+func runAndPropagate(host Host, cl *Client, ctx *Ctx, d *Descriptor,
+	args [][]byte, cfg *config.Values) resp.Value {
+
 	// Reading the clock is not free -- on a host without a vDSO fast path it
 	// can cost more than a whole GET -- so the two reads are skipped
 	// entirely when latency tracking is off. Call and error counts are
 	// atomic adds and are always kept.
-	cfg := host.Config().Snapshot()
 	if !cfg.TrackCommandLatency {
 		result := d.Handler(ctx)
 		host.Commands().recordUntimed(d, result.IsError())
 		propagate(host, cl, ctx, d, args)
-		cl.Out.WriteValue(result)
-		return
+		return result
 	}
 
 	start := time.Now()
@@ -52,7 +77,7 @@ func Execute(host Host, cl *Client, args [][]byte) {
 	}
 
 	propagate(host, cl, ctx, d, args)
-	cl.Out.WriteValue(result)
+	return result
 }
 
 // resolve finds the descriptor for a command and applies every check that

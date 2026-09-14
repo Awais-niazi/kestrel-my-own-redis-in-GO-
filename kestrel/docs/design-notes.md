@@ -7,7 +7,7 @@ with the failing case, not just the concern.
 
 ## 1. Fuzzy snapshots are not correct for cross-key read-modify-write effects
 
-**Severity: correctness. Blocks M3.**
+**Severity: correctness. Resolved — mechanism landed ahead of M3.**
 
 §7.3 argues that chunked fuzzy snapshots recover correctly because "every
 effect targets a known key set, hence a known shard set, and the per-shard
@@ -73,41 +73,75 @@ write amplification ADR-008 rejected when it turned down physical logging: a
 `ZUNIONSTORE` over a million members would write a million members to the
 log.
 
-### Recommended fix
+### Resolution
 
-Two parts, both small:
+Two parts, both small, both now in place.
 
-1. **Serialize shards in ascending index order** so per-shard offsets are
-   monotonically non-decreasing. This is already the natural implementation
-   and should be written down as an invariant, because part 2 depends on it.
+1. **Shards are serialized in ascending index order**, databases likewise, so
+   the per-shard offsets a snapshot records are monotonically non-decreasing
+   and the window is a single interval. This was already the natural
+   implementation; it is now written down as an invariant on
+   `Keyspace.SnapshotWindow`, because part 2 depends on it.
 
-2. **Exclude cross-shard read-modify-write effects from the snapshot
-   window.** Give the snapshotter a lock it holds (shared) for its entire
-   duration, and have the affected commands take it exclusively. No such
-   effect can then have an offset inside `[min(offset), max(offset)]`, so the
-   per-shard filter is never asked to apply one against inconsistent shard
-   states.
+2. **Cross-shard read-modify-write effects are excluded from the snapshot
+   window.** `Keyspace.SnapshotWindow` holds a guard for the whole
+   serialization pass, and the affected commands hold it around both their
+   execution and the propagation of their effect. No such effect can then
+   carry an offset inside `[min(offset), max(offset)]`, so the per-shard
+   filter is never asked to apply one against inconsistent shard state.
 
-   The cost is that `RENAME` and the `*STORE` family block for the duration
-   of a snapshot. Those commands are rare in the workloads §4 describes, and
-   the alternative — blocking every write — is what ADR-009 rejected. This
-   should be measured and documented as a known pause, and surfaced as a
-   metric (`cross_key_command_blocked_seconds`).
+   The guard has to span propagation, not just keyspace access: it is the
+   effect's *log offset* that must fall outside the window, and the offset is
+   assigned when the effect is propagated.
 
-An alternative worth pricing: materialize for scalar values below a size
-threshold and fall back to the barrier only above it. That keeps the common
-`RENAME` of a small string entirely lock-free.
+**Correction to the original write-up.** The first version of this note had
+the lock polarity backwards -- the snapshotter holding it shared and the
+commands exclusively. That would have serialized every cross-shard command
+against every other while permitting two concurrent snapshots, which is both
+slower and unsound. The requirement is mutual exclusion between the snapshot
+and the set of cross-shard commands, and nothing more: the snapshotter takes
+the guard exclusively, the commands share it.
 
-**Until M3 lands**, `RENAME`, `RENAMENX` and `COPY` propagate the operation
-rather than a materialized value, matching the reference implementation. The
-code carries a pointer to this note so the decision is not silently
-inherited.
+### Making the declaration mandatory
+
+Marking the affected commands with a flag only catches the ones someone
+remembers to mark, and the property cannot be inferred from the command
+table: `ZUNIONSTORE` declares `FirstKey` and `LastKey` of 1, naming only its
+destination, so a key-specification check would miss it.
+
+So locality is a **required declaration**, in the same shape and for the same
+reason as `Effect` (ADR-008): `Descriptor.Locality` must be
+`LocalityShardLocal` or `LocalityCrossShard` on every write command, and
+`register` panics on a write command that leaves it unset. A new write
+command cannot be added without answering the question.
+
+The 16 commands that answer `LocalityCrossShard` today are listed in
+`crossShardCommands` in `command/locality_test.go`, which fails if the table
+and the list disagree. `SORT` is in it unconditionally even though only
+`SORT ... STORE` reads across shards; the declaration is static and `SORT_RO`
+covers the read-only case, so the over-approximation is cheaper than making
+it dynamic.
+
+### Cost
+
+`RENAME`, `SWAPDB` and the `*STORE` family block for the duration of a
+snapshot. Those are rare in the workloads §4 describes, and the alternative
+-- blocking every write -- is what ADR-009 rejected. Outside a snapshot the
+guard is an uncontended `RLock`; `BenchmarkGet` is unchanged at 0
+allocations. The pause should be surfaced as a metric
+(`cross_shard_command_blocked_seconds`) when the snapshotter lands.
+
+An alternative that was considered and not taken: materialize the effect as a
+pure write (`SET dst <value>` + `DEL src`) below a size threshold, falling
+back to the guard above it. That keeps a `RENAME` of a small string entirely
+lock-free, but it puts two propagation paths in the commands most likely to
+diverge. It is worth pricing again if the snapshot pause measures badly.
 
 ---
 
 ## 2. SWAPDB and per-shard snapshot offsets
 
-**Severity: correctness. Affects M3, and is evidence for Q3.**
+**Severity: correctness. Resolved by the same mechanism as issue 1, and still evidence for Q3.**
 
 `SWAPDB` exchanges the shard arrays of two databases. Per-shard snapshot
 offsets are recorded per database *and* per shard, so a `SWAPDB` inside the
@@ -115,9 +149,16 @@ snapshot window moves a shard's data out from under the offset recorded for
 it. Replaying a record that targets `db0/shard3` against what is now
 `db1/shard3` is straightforwardly wrong.
 
-`SWAPDB` is already implemented behind the global barrier write lock, so the
-fix is the same shape as issue 1: exclude it from the snapshot window
-entirely. It is cheap to do, because `SWAPDB` is already a barrier operation.
+`SWAPDB` is already implemented behind the global barrier write lock, but the
+barrier is only held at snapshot *start*, so a `SWAPDB` part-way through a
+serialization pass was still possible. It now declares `LocalityCrossShard`
+and is excluded from the whole window by the issue 1 guard. The mechanism
+covers both problems because they are the same problem: an effect whose
+correct replay depends on shard state the snapshot recorded at a different
+instant.
+
+This is worth noting as a small win for the design: `SWAPDB` needed no
+special case.
 
 This is a concrete data point for **Q3** ("do we support multiple logical
 databases?"). Multiple databases cost real complexity in the snapshot and

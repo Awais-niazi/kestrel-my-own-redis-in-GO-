@@ -48,12 +48,14 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "FLUSHDB", Arity: -1, Flags: Write, Effect: EffectCanonical,
+		Locality:   LocalityShardLocal,
 		Categories: []string{"keyspace", "write", "slow", "dangerous"},
 		Summary:    "Removes all keys from the current database.",
 		Handler:    cmdFlushDB,
 	})
 	register(&Descriptor{
 		Name: "FLUSHALL", Arity: -1, Flags: Write, Effect: EffectCanonical,
+		Locality:   LocalityShardLocal,
 		Categories: []string{"keyspace", "write", "slow", "dangerous"},
 		Summary:    "Removes all keys from all databases.",
 		Handler:    cmdFlushAll,

@@ -21,6 +21,7 @@ func init() {
 		front, mustExist := r.front, r.mustExist
 		register(&Descriptor{
 			Name: r.name, Arity: -3, Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"write", "list", "fast"},
 			Summary:    r.summary,
@@ -38,6 +39,7 @@ func init() {
 		front := r.front
 		register(&Descriptor{
 			Name: r.name, Arity: -2, Flags: Write | Fast, Effect: EffectVerbatim,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"write", "list", "fast"},
 			Summary:    r.summary,
@@ -58,6 +60,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "LSET", Arity: 4, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "list", "slow"},
 		Summary:    "Sets the value of an element in a list by its index.",
@@ -71,6 +74,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "LINSERT", Arity: 5, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "list", "slow"},
 		Summary:    "Inserts an element before or after another element in a list.",
@@ -78,6 +82,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "LREM", Arity: 4, Flags: Write, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "list", "slow"},
 		Summary:    "Removes elements from a list.",
@@ -85,6 +90,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "LTRIM", Arity: 4, Flags: Write, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "list", "slow"},
 		Summary:    "Removes elements from both ends a list, keeping only a range.",
@@ -98,6 +104,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "LMOVE", Arity: 5, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"write", "list", "slow"},
 		Summary:    "Moves an element from one list to another.",
@@ -105,6 +112,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "RPOPLPUSH", Arity: 3, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"write", "list", "slow"},
 		Summary:    "Moves the last element of a list to the front of another. Deprecated in favour of LMOVE.",

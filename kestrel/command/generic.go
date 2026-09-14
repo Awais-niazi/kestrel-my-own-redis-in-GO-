@@ -15,6 +15,7 @@ func init() {
 		}
 		register(&Descriptor{
 			Name: name, Arity: -2, Flags: Write | Fast, Effect: EffectVerbatim,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: -1, Step: 1,
 			Categories: []string{"keyspace", "write", "fast"},
 			Summary:    summary,
@@ -41,6 +42,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "RENAME", Arity: 3, Flags: Write, Effect: EffectVerbatim,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"keyspace", "write", "slow"},
 		Summary:    "Renames a key and overwrites the destination.",
@@ -48,6 +50,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "RENAMENX", Arity: 3, Flags: Write | Fast, Effect: EffectCanonical,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"keyspace", "write", "fast"},
 		Summary:    "Renames a key only when the target key name doesn't exist.",
@@ -55,6 +58,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "COPY", Arity: -3, Flags: Write | DenyOOM, Effect: EffectCanonical,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"keyspace", "write", "slow"},
 		Summary:    "Copies the value of a key to a new key.",
@@ -102,6 +106,7 @@ func init() {
 		unit := e.unit
 		register(&Descriptor{
 			Name: e.name, Arity: -3, Flags: Write | Fast, Effect: EffectCanonical,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"keyspace", "write", "fast"},
 			Summary:    e.summary,
@@ -110,6 +115,7 @@ func init() {
 	}
 	register(&Descriptor{
 		Name: "PERSIST", Arity: 2, Flags: Write | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"keyspace", "write", "fast"},
 		Summary:    "Removes the expiration time of a key.",
@@ -162,9 +168,11 @@ func cmdType(c *Ctx) resp.Value {
 // RENAME and COPY read one key and write another. When those keys live in
 // different shards, the effect is not safe to replay against a fuzzy
 // snapshot whose shards were serialized at different offsets: see issue 1 in
-// docs/design-notes.md. Propagating the operation is correct today, because
-// nothing consumes the effect stream yet, and must be revisited when the
-// snapshotter lands in M3.
+// docs/design-notes.md.
+//
+// Both declare LocalityCrossShard, so the dispatcher keeps their effects out
+// of the snapshot window entirely and the operation stays safe to propagate
+// as written, rather than being materialized into a pure write.
 func cmdRename(c *Ctx) resp.Value {
 	nx := strings.EqualFold(string(c.Name()), "renamenx")
 	ok, err := c.DB().Rename(c.Arg(1), c.Arg(2), nx)

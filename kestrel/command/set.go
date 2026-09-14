@@ -12,6 +12,7 @@ var effSREM = []byte("SREM")
 func init() {
 	register(&Descriptor{
 		Name: "SADD", Arity: -3, Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "set", "fast"},
 		Summary:    "Adds one or more members to a set.",
@@ -19,6 +20,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "SREM", Arity: -3, Flags: Write | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "set", "fast"},
 		Summary:    "Removes one or more members from a set.",
@@ -50,6 +52,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "SPOP", Arity: -2, Flags: Write | Fast, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "set", "fast"},
 		Summary:    "Returns and removes one or more random members from a set.",
@@ -63,6 +66,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "SMOVE", Arity: 4, Flags: Write | Fast, Effect: EffectVerbatim,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"write", "set", "fast"},
 		Summary:    "Moves a member from one set to another.",
@@ -86,6 +90,7 @@ func init() {
 		})
 		register(&Descriptor{
 			Name: r.name + "STORE", Arity: -3, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+			Locality: LocalityCrossShard,
 			FirstKey: 1, LastKey: -1, Step: 1,
 			Categories: []string{"write", "set", "slow"},
 			Summary:    r.summary + " Stores the result in a key.",

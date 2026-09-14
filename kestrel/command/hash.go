@@ -12,6 +12,7 @@ var effHSET = []byte("HSET")
 func init() {
 	register(&Descriptor{
 		Name: "HSET", Arity: -4, Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "hash", "fast"},
 		Summary:    "Creates or modifies the value of a field in a hash.",
@@ -19,6 +20,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "HMSET", Arity: -4, Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "hash", "fast"},
 		Summary:    "Sets the values of multiple fields. Deprecated alias of HSET.",
@@ -26,6 +28,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "HSETNX", Arity: 4, Flags: Write | DenyOOM | Fast, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "hash", "fast"},
 		Summary:    "Sets the value of a field in a hash only when the field doesn't exist.",
@@ -45,6 +48,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "HDEL", Arity: -3, Flags: Write | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "hash", "fast"},
 		Summary:    "Deletes one or more fields and their values from a hash.",
@@ -89,6 +93,7 @@ func init() {
 	}
 	register(&Descriptor{
 		Name: "HINCRBY", Arity: 4, Flags: Write | DenyOOM | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "hash", "fast"},
 		Summary:    "Increments the integer value of a field by a number.",
@@ -96,6 +101,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "HINCRBYFLOAT", Arity: 4, Flags: Write | DenyOOM | Fast, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "hash", "fast"},
 		Summary:    "Increments the floating point value of a field by a number.",

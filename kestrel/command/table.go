@@ -79,6 +79,44 @@ const (
 	EffectCanonical
 )
 
+// Locality declares whether a write command's effect can depend on the
+// current value of a key outside the shard it writes (ADR-009, and
+// docs/design-notes.md issue 1).
+//
+// A chunked fuzzy snapshot serializes shards one at a time, so two shards in
+// the same snapshot can reflect different instants of the log. Recovery
+// replays each record against the shards whose recorded offset precedes it.
+// That reconstruction is sound only for effects whose result is determined
+// by the arguments and by keys living in the shard being written. An effect
+// that reads key A and writes key B, where the two hash to different shards,
+// can be replayed against a shard state that no longer holds what it read:
+// the value is silently lost or, worse, written from a value the leader
+// never saw.
+//
+// Every write command must therefore declare its locality. The declaration
+// is checked at registration, for the same reason Effect is: the failure it
+// prevents is a silent divergence between leader and replica, which is the
+// worst class of bug this system can have (R5). A command that has not
+// answered the question does not register.
+type Locality uint8
+
+// Locality declarations.
+const (
+	// LocalityUnset is the zero value. It is not a legal declaration for a
+	// write command.
+	LocalityUnset Locality = iota
+	// LocalityShardLocal means every key this command writes is written
+	// from the command's own arguments, or from the current value of that
+	// same key. Both a pure write (SET, MSET) and a same-key
+	// read-modify-write (INCR, APPEND, LPUSH) qualify: read and write are
+	// the same key, hence the same shard, hence the same snapshot instant.
+	LocalityShardLocal
+	// LocalityCrossShard means at least one key's new value depends on the
+	// current value of a different key, which may hash to another shard.
+	// The dispatcher excludes these from the snapshot window.
+	LocalityCrossShard
+)
+
 // Handler executes a command and returns the reply.
 type Handler func(c *Ctx) resp.Value
 
@@ -105,6 +143,9 @@ type Descriptor struct {
 	// EffectNone for a command that does not write, and something else for
 	// one that does.
 	Effect EffectKind
+	// Locality declares whether the command's effect can read a key outside
+	// the shard it writes. Every write command must set it.
+	Locality Locality
 	// Subcommands holds the children of a container command such as CONFIG.
 	Subcommands map[string]*Descriptor
 
@@ -173,6 +214,14 @@ func validate(d *Descriptor) {
 	}
 	if !d.Is(Write) && d.Effect != EffectNone {
 		panic("command: " + where + " declares an Effect but is not a write command")
+	}
+	if d.Is(Write) && d.Locality == LocalityUnset {
+		panic("command: " + where + " is a write command but does not declare " +
+			"whether its effect reads keys outside the shard it writes; see " +
+			"ADR-009 and docs/design-notes.md issue 1")
+	}
+	if !d.Is(Write) && d.Locality != LocalityUnset {
+		panic("command: " + where + " declares a Locality but is not a write command")
 	}
 	for name, sub := range d.Subcommands {
 		sub.Name = strings.ToUpper(name)

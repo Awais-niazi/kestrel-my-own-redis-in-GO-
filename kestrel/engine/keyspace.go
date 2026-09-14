@@ -146,6 +146,13 @@ type Keyspace struct {
 	// FLUSHALL, SWAPDB and snapshot start hold the write side (ADR-003).
 	barrier sync.RWMutex
 
+	// snapshotGuard keeps cross-shard read-modify-write commands out of the
+	// window during which a chunked fuzzy snapshot is serialized. The
+	// snapshotter holds the write side for the whole serialization; the
+	// affected commands hold the read side, so they exclude a snapshot and
+	// not each other. See SnapshotWindow.
+	snapshotGuard sync.RWMutex
+
 	opts  Options
 	dbs   []*DB
 	clock atomic.Pointer[Clock]
@@ -264,6 +271,52 @@ func (ks *Keyspace) Barrier(fn func()) {
 	defer ks.barrier.Unlock()
 	fn()
 }
+
+// SnapshotWindow runs fn with no cross-shard read-modify-write command in
+// flight, and admits none until it returns. The snapshotter calls it around
+// the whole serialization pass.
+//
+// A chunked fuzzy snapshot (ADR-009) records a separate log offset per shard
+// and serializes shards one at a time, so shard i and shard j in the same
+// snapshot can reflect different instants of the log. Recovery replays each
+// record against the shards whose recorded offset precedes it, which
+// reconstructs the missing effects exactly -- provided every effect's result
+// is determined by its arguments and by keys in the shard being written.
+//
+// An effect that reads key A and writes key B breaks that, when the two hash
+// to different shards. If A's shard was serialized after the effect and B's
+// before it, replay re-runs the command against a shard that no longer holds
+// what it read: the write is lost, or is made from a value the leader never
+// combined. Excluding those commands from the window means no such effect
+// can carry an offset inside [min(offset), max(offset)], so the per-shard
+// filter is never asked to apply one against inconsistent shard state.
+//
+// The cost is that RENAME, SWAPDB and the *STORE family block for the
+// duration of a snapshot. Those are rare in the workloads the design targets,
+// and the alternative -- blocking every write -- is what ADR-009 rejected.
+//
+// Two invariants this depends on, both of which callers must preserve:
+//
+//   - Shards are serialized in ascending index order within a database, and
+//     databases in ascending index order, so the recorded offsets are
+//     monotonically non-decreasing and the window is a single interval.
+//   - fn must not itself run a cross-shard command; the guard is not
+//     reentrant.
+func (ks *Keyspace) SnapshotWindow(fn func()) {
+	ks.snapshotGuard.Lock()
+	defer ks.snapshotGuard.Unlock()
+	fn()
+}
+
+// BeginCrossShard blocks until no snapshot is being serialized and marks a
+// cross-shard read-modify-write command as in flight. It must be paired with
+// EndCrossShard, and must be held across both the command's execution and
+// the propagation of its effect: it is the effect's log offset that has to
+// fall outside the snapshot window, not merely the keyspace access.
+func (ks *Keyspace) BeginCrossShard() { ks.snapshotGuard.RLock() }
+
+// EndCrossShard releases the guard taken by BeginCrossShard.
+func (ks *Keyspace) EndCrossShard() { ks.snapshotGuard.RUnlock() }
 
 // SwapDB exchanges the contents of two databases.
 func (ks *Keyspace) SwapDB(i, j int) error {

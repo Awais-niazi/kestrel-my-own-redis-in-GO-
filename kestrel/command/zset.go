@@ -17,6 +17,7 @@ var (
 func init() {
 	register(&Descriptor{
 		Name: "ZADD", Arity: -4, Flags: Write | DenyOOM | Fast, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "sortedset", "fast"},
 		Summary:    "Adds one or more members to a sorted set, or updates their scores.",
@@ -24,6 +25,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "ZINCRBY", Arity: 4, Flags: Write | DenyOOM | Fast, Effect: EffectCanonical,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "sortedset", "fast"},
 		Summary:    "Increments the score of a member in a sorted set.",
@@ -31,6 +33,7 @@ func init() {
 	})
 	register(&Descriptor{
 		Name: "ZREM", Arity: -3, Flags: Write | Fast, Effect: EffectVerbatim,
+		Locality: LocalityShardLocal,
 		FirstKey: 1, LastKey: 1, Step: 1,
 		Categories: []string{"write", "sortedset", "fast"},
 		Summary:    "Removes one or more members from a sorted set.",
@@ -89,6 +92,7 @@ func init() {
 	}
 	register(&Descriptor{
 		Name: "ZRANGESTORE", Arity: -5, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+		Locality: LocalityCrossShard,
 		FirstKey: 1, LastKey: 2, Step: 1,
 		Categories: []string{"write", "sortedset", "slow"},
 		Summary:    "Stores a range of members from a sorted set in a key.",
@@ -121,6 +125,7 @@ func init() {
 		highest := r.highest
 		register(&Descriptor{
 			Name: r.name, Arity: -2, Flags: Write | Fast, Effect: EffectCanonical,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"write", "sortedset", "fast"},
 			Summary:    r.summary,
@@ -141,6 +146,7 @@ func init() {
 			// Same-key ranges are deterministic against the same base
 			// state, so these are safe to log as they arrived.
 			Name: r.name, Arity: 4, Flags: Write, Effect: EffectVerbatim,
+			Locality: LocalityShardLocal,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"write", "sortedset", "slow"},
 			Summary:    r.summary,
@@ -165,6 +171,7 @@ func init() {
 		})
 		register(&Descriptor{
 			Name: r.name + "STORE", Arity: -4, Flags: Write | DenyOOM, Effect: EffectVerbatim,
+			Locality: LocalityCrossShard,
 			FirstKey: 1, LastKey: 1, Step: 1,
 			Categories: []string{"write", "sortedset", "slow"},
 			Summary:    r.summary + " Stores the result in a key.",
