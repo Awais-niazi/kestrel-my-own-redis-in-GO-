@@ -37,11 +37,19 @@ cover:
 
 # The RESP parser is one of the places untrusted bytes enter the process, so
 # it gets dedicated fuzzing time. M0's exit criterion is one clean hour.
+# Go fuzzes one target per invocation, so each gets its own run. FUZZTIME
+# sets the budget per target, not in total.
+FUZZ_TARGETS = ./resp/:FuzzReadCommand ./persist/:FuzzReader ./persist/:FuzzRecordRoundTrip
+
 fuzz:
-	$(GO) test ./resp/ -run XXX -fuzz FuzzReadCommand -fuzztime $(or $(FUZZTIME),60s)
+	@for t in $(FUZZ_TARGETS); do \
+		pkg=$${t%%:*}; fn=$${t##*:}; \
+		echo "==> $$pkg $$fn"; \
+		$(GO) test $$pkg -run XXX -fuzz $$fn -fuzztime $(or $(FUZZTIME),60s) || exit 1; \
+	done
 
 fuzz-hour:
-	$(GO) test ./resp/ -run XXX -fuzz FuzzReadCommand -fuzztime 1h
+	@$(MAKE) fuzz FUZZTIME=1h
 
 release:
 	@for p in $(PLATFORMS); do \
