@@ -196,7 +196,7 @@ func TestReplayRejectsWhatIsNotAnEffect(t *testing.T) {
 			for i, a := range tc.args {
 				args[i] = []byte(a)
 			}
-			if err := r.Apply(0, args); err == nil {
+			if err := r.Apply(0, 0, args); err == nil {
 				t.Errorf("%v was replayed", tc.args)
 			}
 		})
@@ -206,7 +206,7 @@ func TestReplayRejectsWhatIsNotAnEffect(t *testing.T) {
 func TestReplayAppliesToTheNamedDatabase(t *testing.T) {
 	h := newTestHost(t)
 	r := NewReplayer(h)
-	if err := r.Apply(3, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
+	if err := r.Apply(3, 0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
 		t.Fatal(err)
 	}
 	s := newSession(t, h)
@@ -222,10 +222,10 @@ func TestReplayAppliesToTheNamedDatabase(t *testing.T) {
 func TestReplayReportsTheFailingCommand(t *testing.T) {
 	h := newTestHost(t)
 	r := NewReplayer(h)
-	if err := r.Apply(0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
+	if err := r.Apply(0, 0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
 		t.Fatal(err)
 	}
-	err := r.Apply(0, [][]byte{[]byte("LPUSH"), []byte("k"), []byte("x")})
+	err := r.Apply(0, 0, [][]byte{[]byte("LPUSH"), []byte("k"), []byte("x")})
 	if err == nil {
 		t.Fatal("a WRONGTYPE replay was accepted")
 	}

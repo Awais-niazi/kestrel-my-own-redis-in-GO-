@@ -60,16 +60,26 @@ func WriteSnapshot(ks *engine.Keyspace, sink SnapshotSink, opts SnapshotOptions)
 	for i := 0; i < ks.NumDatabases(); i++ {
 		db := ks.DB(i)
 		for shard := 0; shard < db.NumShards(); shard++ {
-			// The offset is read before the shard lock is taken, so it can
-			// only be older than the contents that follow. An anchor that
-			// were newer than its shard would tell recovery to skip a
-			// record the shard does not have.
-			if err := sink.Anchor(i, shard, opts.Offset()); err != nil {
+			// The shard captures its own anchor, because only the engine
+			// can read the log offset at the instant that makes it exact:
+			// with the shard's propagation lock held, so that no write to
+			// it is between having been applied and having been logged.
+			//
+			// That means the anchor is known only once the shard has been
+			// walked, so the records are buffered and the anchor is written
+			// before them.
+			w := shardWriter{db: i, batch: batch}
+			anchor, err := db.SnapshotShard(shard, opts.Offset, w.entry)
+			if err != nil {
 				return err
 			}
-			w := shardWriter{sink: sink, db: i, batch: batch}
-			if err := db.SnapshotShard(shard, w.entry); err != nil {
+			if err := sink.Anchor(i, shard, anchor); err != nil {
 				return err
+			}
+			for _, rec := range w.buffered {
+				if err := sink.Record(i, rec); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -77,11 +87,15 @@ func WriteSnapshot(ks *engine.Keyspace, sink SnapshotSink, opts SnapshotOptions)
 }
 
 // shardWriter turns snapshot entries into rebuild commands.
+//
+// Records are buffered rather than written straight through, for two
+// reasons. The shard's anchor is not known until the walk has started, and
+// it has to precede the records it describes; and the walk runs with the
+// shard's data lock held, where a write to a file has no business being.
 type shardWriter struct {
-	sink  SnapshotSink
-	db    int
-	batch int
-	args  [][]byte // reused across records
+	db       int
+	batch    int
+	buffered [][][]byte
 }
 
 var (
@@ -146,16 +160,33 @@ func (w *shardWriter) chunked(verb, key []byte, elems [][]byte, stride int) erro
 		if end > len(elems) {
 			end = len(elems)
 		}
-		w.args = append(w.args[:0], verb, key)
-		w.args = append(w.args, elems[start:end]...)
-		if err := w.sink.Record(w.db, w.args); err != nil {
-			return err
+		args := make([][]byte, 0, 2+end-start)
+		args = append(args, verb, copyOf(key))
+		for _, e := range elems[start:end] {
+			args = append(args, copyOf(e))
 		}
+		w.buffered = append(w.buffered, args)
 	}
 	return nil
 }
 
 func (w *shardWriter) emit(parts ...[]byte) error {
-	w.args = append(w.args[:0], parts...)
-	return w.sink.Record(w.db, w.args)
+	args := make([][]byte, 0, len(parts))
+	for _, p := range parts {
+		args = append(args, copyOf(p))
+	}
+	w.buffered = append(w.buffered, args)
+	return nil
+}
+
+// copyOf detaches a slice from the keyspace.
+//
+// The walk hands out slices that alias stored values, and an entry buffer
+// that is reused between keys; both are valid only while the shard lock is
+// held. Buffering the records past that point means copying, which is the
+// price of not writing to a file under a lock.
+func copyOf(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
 }

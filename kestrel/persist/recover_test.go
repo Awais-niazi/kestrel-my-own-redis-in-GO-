@@ -17,7 +17,7 @@ type collector struct {
 	failOn  int
 }
 
-func (c *collector) Apply(db int, args [][]byte) error {
+func (c *collector) Apply(db int, offset uint64, args [][]byte) error {
 	if c.failOn > 0 && len(c.applied) == c.failOn-1 {
 		return errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}

@@ -18,7 +18,7 @@ sorted sets, generic keyspace commands, and expiration all work.
 | M0 | RESP2 codec, TCP/TLS server, connection handling, config, fuzz harness | done |
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
-| M3 | Append log, snapshots, recovery, compaction | in progress: log, snapshots and recovery done, not yet wired |
+| M3 | Append log, snapshots, recovery, compaction | in progress: log, snapshots and restore done, not yet wired |
 | M4 | Replication | not started |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
@@ -33,10 +33,11 @@ server does not open any of them yet**. Data lives in memory only and is lost on
 says so in its startup log, every time, and will keep saying so until the
 two are wired together.
 
-What does work, and is tested end to end, is the round trip: a randomized
-write stream recorded to a real log file, replayed into an empty keyspace,
-and compared key by key against the host that produced it -- including under
-a clock an hour ahead, which is what a real restart looks like.
+What does work, and is tested end to end, is the whole round trip: a
+snapshot taken while four goroutines keep writing, plus the log that ran
+underneath it, replayed into an empty keyspace and compared key by key
+against the host that produced it -- including under a clock an hour ahead,
+which is what a real restart looks like.
 
 The effect stream those subsystems will consume is already built and tested,
 so M3 attaches to a working propagation path rather than introducing one.

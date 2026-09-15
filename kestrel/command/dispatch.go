@@ -31,22 +31,40 @@ func Execute(host Host, cl *Client, args [][]byte) {
 
 	cfg := host.Config().Snapshot()
 
-	// A cross-shard read-modify-write command must not have its effect land
-	// inside a snapshot window, so the guard spans the handler and the
-	// propagation together: it is the effect's log offset that has to fall
-	// outside the window. See Keyspace.SnapshotWindow.
+	if !d.Is(Write) {
+		cl.Out.WriteValue(runAndPropagate(host, cl, ctx, d, args, cfg))
+		return
+	}
+
+	ks := host.Keyspace()
+
+	// Two locks, both spanning the handler and the propagation of its
+	// effect, and both released before the reply is written -- that write
+	// can block on a slow client, and neither a snapshot nor another write
+	// should wait for one.
 	//
-	// It is released before the reply is written, because that write can
-	// block on a slow client and a snapshot must not wait for one.
+	// The ordering lock makes the log record effects in the order they were
+	// applied. Without it two writes to the same key can mutate in one
+	// order and reach the log in the other, and the dataset a restart
+	// rebuilds is then not the one that was running. See engine/order.go.
+	//
+	// The cross-shard guard keeps an effect that reads one key and writes
+	// another out of a snapshot window, where the per-shard recovery filter
+	// could not replay it safely. See Keyspace.SnapshotWindow.
 	if d.Locality == LocalityCrossShard {
-		ks := host.Keyspace()
 		ks.BeginCrossShard()
+		order := ks.OrderAllWrites()
 		result := runAndPropagate(host, cl, ctx, d, args, cfg)
+		order.Done()
 		ks.EndCrossShard()
 		cl.Out.WriteValue(result)
 		return
 	}
-	cl.Out.WriteValue(runAndPropagate(host, cl, ctx, d, args, cfg))
+
+	order := ks.DB(cl.DBIndex).OrderWrites(ExtractKeys(d, args))
+	result := runAndPropagate(host, cl, ctx, d, args, cfg)
+	order.Done()
+	cl.Out.WriteValue(result)
 }
 
 // runAndPropagate executes the handler, records its cost and hands its

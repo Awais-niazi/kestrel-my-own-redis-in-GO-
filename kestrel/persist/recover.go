@@ -14,9 +14,18 @@ import (
 // provides the implementation; persist stays free of it so that the log
 // format has no opinion about the command table.
 //
+// offset is the record's position in the log stream. An applier that is
+// reconciling a fuzzy snapshot needs it to decide, per key, whether the
+// shard holding that key already absorbed this record. One that is replaying
+// a log from empty ignores it.
+//
+// When a snapshot is being loaded, offset is the anchor of the shard whose
+// contents are being restored, so the value means the same thing in both
+// paths: "the log position these bytes correspond to".
+//
 // Args alias the reader's buffer and must not be retained past the call.
 type Applier interface {
-	Apply(db int, args [][]byte) error
+	Apply(db int, offset uint64, args [][]byte) error
 }
 
 // CorruptPolicy decides what happens when a log cannot be read to its end.
@@ -59,12 +68,19 @@ type RecoverOptions struct {
 	// Logger receives progress and any warning about discarded records. It
 	// may be nil.
 	Logger *slog.Logger
+	// From skips records that start before this offset. A recovery that
+	// begins from a snapshot passes the snapshot's first anchor: everything
+	// earlier is already in the snapshot for every shard.
+	From uint64
 }
 
 // Result describes what a recovery pass did.
 type Result struct {
 	// Records is how many effects were applied.
 	Records int64
+	// Skipped is how many records were passed over because they predate
+	// RecoverOptions.From, and are therefore already in the snapshot.
+	Skipped int64
 	// Offset is the stream offset just past the last applied record. A log
 	// reopened for appending continues from here.
 	Offset uint64
@@ -105,7 +121,16 @@ func Recover(opts RecoverOptions, a Applier) (Result, error) {
 	res.Offset = r.Base()
 	for r.Next() {
 		rec := r.Record()
-		if err := a.Apply(rec.DB, rec.Args); err != nil {
+		if rec.Kind != KindEffect {
+			return res, fmt.Errorf("%w: record at offset %d is not an effect",
+				ErrCorrupt, rec.Offset)
+		}
+		if rec.Offset < opts.From {
+			res.Skipped++
+			res.Offset = r.Offset()
+			continue
+		}
+		if err := a.Apply(rec.DB, rec.Offset, rec.Args); err != nil {
 			return res, fmt.Errorf("%w at offset %d: %w", ErrDiverged, rec.Offset, err)
 		}
 		res.Records++

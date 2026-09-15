@@ -188,6 +188,15 @@ func (ks *Keyspace) ExpirePass(deadline time.Time) int {
 	total := 0
 	for _, db := range ks.dbs {
 		for _, s := range db.shards {
+			// The propagation lock is held for the whole of this shard's
+			// sampling. Reaping a key emits a DEL, and that DEL has to
+			// reach the log in the same order relative to concurrent writes
+			// as the deletion reached the keyspace -- the active cycle runs
+			// on its own goroutine, so without this it is free to interleave
+			// with a write that is between mutating a key and logging it.
+			// See engine/order.go.
+			s.prop.Lock()
+
 			// Re-sample the same shard while the hit rate stays high: a
 			// shard where most sampled keys were expired probably has many
 			// more (ADR-007).
@@ -198,9 +207,11 @@ func (ks *Keyspace) ExpirePass(deadline time.Time) int {
 					break
 				}
 				if time.Now().After(deadline) {
+					s.prop.Unlock()
 					return total
 				}
 			}
+			s.prop.Unlock()
 			if time.Now().After(deadline) {
 				return total
 			}

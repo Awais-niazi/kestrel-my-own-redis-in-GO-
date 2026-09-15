@@ -441,3 +441,103 @@ load speed: a sorted set is stored as `ZADD` arguments where a packed binary
 encoding would be smaller. For a dataset that fits in memory by definition,
 the format is not the bottleneck -- and the alternative is a second binary
 format with its own corruption modes to get right.
+
+---
+
+## 10. The log was not recording effects in the order they were applied
+
+**Severity: correctness. Affected log recovery and replication, not only
+snapshots.**
+
+Found by the first test that ran concurrent writers against a snapshot, and
+it is the most serious defect the project has turned up so far.
+
+### The failing case
+
+A command mutates the keyspace under a shard's data lock and releases it.
+Its effect reaches the log afterwards, from `dispatch.propagate`. Nothing
+kept those two steps together, so two goroutines writing the same key could
+interleave like this:
+
+```
+A: SET k 1     mutates, releases the shard lock
+B: SET k 2     mutates, releases the shard lock
+B: appends "SET k 2"
+A: appends "SET k 1"
+```
+
+The keyspace holds `2`. The log says `1`. Every replica built from that
+stream holds `1`, and so does the dataset after the next restart. Nothing
+reports an error at any point.
+
+The test that found it saw an `MSET` key end as `131` on the live host and
+`x` on the restored one.
+
+### Why nothing caught it for four milestones
+
+`TestFollowerConverges` and `TestRecoveryConverges` both drive a single
+session, issuing one command at a time. A single writer cannot reorder
+against itself, so both tests were asking a question the bug is invisible
+to -- the same shape of blind spot as issue 8's shared clock, from a
+different direction.
+
+**Two differential tests had agreed with each other for four milestones
+while the thing they were testing was wrong.** The lesson is not that these
+tests are bad; it is that a convergence test only covers the concurrency it
+actually creates.
+
+### The fix
+
+A second lock per shard, `shard.prop`, taken by the command layer before the
+handler runs and released after the effect has been propagated. Two writes
+to the same shard therefore enter the log in the order they were applied.
+Writes to different shards still run concurrently, and reads never take it.
+
+It is a separate lock from the shard's `mu`, and always taken first, because
+it must be held for longer: `mu` covers the mutation, `prop` covers the
+mutation *and* the record of it reaching the log.
+
+The active expiry cycle takes it too. It reaps on its own goroutine and each
+reap emits a `DEL`, so without it that `DEL` is free to interleave with a
+write that is between mutating a key and logging it.
+
+Commands whose key arguments do not describe the shards they touch -- the
+cross-shard set, plus `FLUSHALL` and `SWAPDB` -- take every shard. They are
+rare and already blocked for the duration of a snapshot, so the blunt answer
+is the right one: a wrong lock set here is a silently misordered log.
+
+### It also makes the snapshot anchor exact
+
+The same lock closes a second hole that had not yet been found. An anchor is
+supposed to mean "this shard holds exactly the effects of the records before
+this offset". Reading the log's offset without `prop` could catch a write
+that had already mutated the shard but had not yet been logged, so its
+record would sit *after* the anchor and be replayed on top of itself. For
+`SET` that is redundant; for `INCR` it is off by one.
+
+`SnapshotShard` now takes `prop`, reads the offset, takes `mu`, and releases
+`prop`. Holding `prop` means nothing is mid-flight; taking `mu` before
+letting go means nothing new can land until the shard has been serialized.
+
+### What it costs
+
+One extra uncontended mutex per write -- `BenchmarkSet` and `BenchmarkIncr`
+show no measurable change, and `BenchmarkGet` is untouched at 0 allocations
+because reads do not take it. Under contention, writes to the *same shard*
+now serialize across the handler and the log append. That is not really new:
+`Log.Append` already serializes every append globally, so the marginal loss
+is the handler's own execution time.
+
+### Remaining gap: lazy expiry on the read path
+
+A read that finds an expired key reaps it and emits a `DEL`, under the shard's
+`mu` but without `prop`, because taking `prop` on every read would put every
+`GET` behind a concurrent write's log append.
+
+The window is narrow -- a key must fall due in the instant between a writer
+mutating it and logging it, and the writer's own lookup would have reaped it
+on the way in -- but narrow is not closed. The fix worth pricing: have reads
+*hide* an expired key, as replica mode already does, and leave the deletion
+and the `DEL` to the active cycle, which holds `prop`. That makes reads
+cheaper as well, and it makes `active-expire no` a memory-leak setting rather
+than a correctness one, which should be stated if it is taken.

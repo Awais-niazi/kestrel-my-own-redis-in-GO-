@@ -428,6 +428,15 @@ func (ks *Keyspace) MemoryEstimate() int64 {
 
 // shard is one partition of a database.
 type shard struct {
+	// prop orders writes against the log. It is taken by the command layer
+	// around a write's execution and the propagation of its effect, and by
+	// the snapshotter while it reads a shard's anchor. See order.go.
+	//
+	// It is a separate lock from mu, and always taken before it, because it
+	// must be held for longer: mu covers the mutation, prop covers the
+	// mutation and the record of it reaching the log.
+	prop sync.Mutex
+
 	mu   sync.Mutex
 	dict map[string]*Object
 	// expires indexes the keys carrying a TTL. It exists so the active

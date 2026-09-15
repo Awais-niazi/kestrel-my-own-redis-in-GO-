@@ -286,7 +286,7 @@ func LoadSnapshot(path string, a Applier) (SnapshotLoad, error) {
 			out.Anchors[ShardRef{DB: db, Shard: shard}] = off
 			continue
 		}
-		if err := a.Apply(rec.DB, rec.Args); err != nil {
+		if err := a.Apply(rec.DB, last, rec.Args); err != nil {
 			return out, fmt.Errorf("%w at offset %d: %w", ErrDiverged, rec.Offset, err)
 		}
 		out.Records++

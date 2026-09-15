@@ -47,6 +47,10 @@ func (db *DB) NumShards() int { return len(db.shards) }
 // SnapshotShard calls fn once for every key in one shard, with the shard
 // locked for the duration.
 //
+// anchorAt is called once, with the shard's propagation lock held and before
+// its data lock is taken, and its result is returned as the shard's anchor.
+// The caller passes the log's current offset.
+//
 // fn must not call back into the engine, and must not block: it holds up
 // every command touching this shard. Serializing into memory is what it is
 // for; writing to a file is not.
@@ -56,14 +60,27 @@ func (db *DB) NumShards() int { return len(db.shards) }
 // it, so including them costs a little space and keeps the shard faithful to
 // the instant it was taken at. Excluding them would need the clock, which
 // would make the snapshot depend on when it was loaded.
-func (db *DB) SnapshotShard(shard int, fn func(*SnapshotEntry) error) error {
+func (db *DB) SnapshotShard(shard int, anchorAt func() uint64, fn func(*SnapshotEntry) error) (uint64, error) {
 	if shard < 0 || shard >= len(db.shards) {
-		return fmt.Errorf("engine: no shard %d", shard)
+		return 0, fmt.Errorf("engine: no shard %d", shard)
 	}
 	s := db.shards[shard]
 	db.ks.barrier.RLock()
 	defer db.ks.barrier.RUnlock()
+
+	// The anchor is read while the shard's propagation lock is held, which
+	// is what makes it exact. Holding prop means no write to this shard is
+	// between having mutated it and having reached the log, so every effect
+	// already in the shard has an offset below the one read here, and every
+	// effect above it is not in the shard yet.
+	//
+	// Taking mu before releasing prop keeps that true for the walk: a write
+	// admitted after prop is released blocks on mu until the shard has been
+	// serialized, and its record lands after the anchor.
+	s.prop.Lock()
+	anchor := anchorAt()
 	s.mu.Lock()
+	s.prop.Unlock()
 	defer s.mu.Unlock()
 
 	var e SnapshotEntry
@@ -94,13 +111,13 @@ func (db *DB) SnapshotShard(shard int, fn func(*SnapshotEntry) error) error {
 				return true
 			})
 		default:
-			return fmt.Errorf("engine: key %q has unknown type %d", k, o.Type)
+			return 0, fmt.Errorf("engine: key %q has unknown type %d", k, o.Type)
 		}
 		if err := fn(&e); err != nil {
-			return err
+			return anchor, err
 		}
 	}
-	return nil
+	return anchor, nil
 }
 
 // ShardIndexOf reports which shard a key belongs to. Recovery uses it to

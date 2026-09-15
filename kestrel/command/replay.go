@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"kestrel/engine"
 	"kestrel/resp"
 )
 
@@ -25,6 +26,11 @@ type Replayer struct {
 	host  Host
 	cl    *Client
 	table *Table
+
+	// anchorOf, when set, reconciles the log against a fuzzy snapshot. See
+	// Filter.
+	anchorOf func(db, shard int) uint64
+	split    [][]byte // reused when a record has to be applied to some keys only
 }
 
 // NewReplayer returns a Replayer that writes into host's keyspace.
@@ -42,13 +48,29 @@ func NewReplayer(host Host) *Replayer {
 	return &Replayer{host: host, cl: cl, table: host.Commands()}
 }
 
+// Filter makes the Replayer reconcile records against a fuzzy snapshot.
+//
+// anchorOf returns the log offset a shard's snapshot contents correspond to,
+// so the shard already holds every record before that offset and needs every
+// record from it onwards. Without a filter every record is applied whole,
+// which is right when replaying a log into an empty keyspace.
+//
+// Passing nil clears the filter.
+func (r *Replayer) Filter(anchorOf func(db, shard int) uint64) *Replayer {
+	r.anchorOf = anchorOf
+	return r
+}
+
 // Apply executes one logged effect against database db.
+//
+// offset is the record's position in the log stream, and matters only when a
+// filter is installed.
 //
 // An error means the record did not replay cleanly, which is a divergence
 // between this keyspace and the one that wrote the log. Recovery stops
 // there: a dataset that is silently not what the log says is worse than a
 // server that refuses to start and explains why.
-func (r *Replayer) Apply(db int, args [][]byte) error {
+func (r *Replayer) Apply(db int, offset uint64, args [][]byte) error {
 	if len(args) == 0 {
 		return fmt.Errorf("replay: empty record")
 	}
@@ -74,6 +96,17 @@ func (r *Replayer) Apply(db int, args [][]byte) error {
 		return fmt.Errorf("replay: no database %d", db)
 	}
 
+	if r.anchorOf != nil {
+		apply, err := r.narrow(d, db, offset, args)
+		if err != nil || apply == nil {
+			return err
+		}
+		args = apply
+	}
+	return r.run(d, args)
+}
+
+func (r *Replayer) run(d *Descriptor, args [][]byte) error {
 	ctx := &r.cl.ctx
 	*ctx = Ctx{Host: r.host, Client: r.cl, Cmd: d, Args: args}
 	reply := d.Handler(ctx)
@@ -81,6 +114,84 @@ func (r *Replayer) Apply(db int, args [][]byte) error {
 		return fmt.Errorf("replay: %s: %s", d.FullName(), reply.Str)
 	}
 	return nil
+}
+
+// narrow returns the arguments to apply for a record, given how far each
+// shard had been snapshotted. It returns nil when the record must be skipped
+// entirely.
+//
+// A shard whose anchor is at or before this record does not have it yet and
+// must be given it. A shard whose anchor is after it already absorbed it,
+// and applying it again would be wrong for anything that is not idempotent:
+// a second INCR or RPUSH is a different value, not a redundant one.
+func (r *Replayer) narrow(d *Descriptor, db int, offset uint64, args [][]byte) ([][]byte, error) {
+	keys := ExtractKeys(d, args)
+	if len(keys) == 0 {
+		// A write with no keys touches the whole database -- FLUSHDB,
+		// FLUSHALL, SWAPDB. All three are cross-shard, so the snapshot
+		// window excluded them and this record cannot be inside it: it
+		// applies everywhere or not at all, and "not at all" is impossible
+		// because recovery starts at the first anchor.
+		return args, nil
+	}
+
+	engineDB := r.host.Keyspace().DB(db)
+	if engineDB == nil {
+		return nil, fmt.Errorf("replay: no database %d", db)
+	}
+	wanted, count := 0, 0
+	for _, k := range keys {
+		count++
+		if offset >= r.anchorOf(db, engineDB.ShardIndexOf(k)) {
+			wanted++
+		}
+	}
+	switch wanted {
+	case count:
+		return args, nil
+	case 0:
+		return nil, nil
+	}
+	return r.splitKeys(d, args, engineDB, db, offset)
+}
+
+// splitKeys rebuilds a record from only the key groups whose shards still
+// need it.
+//
+// This can only happen for a shard-local command with keys in more than one
+// shard, inside the snapshot window. Every cross-shard command is kept out
+// of that window (docs/design-notes.md issue 1), so what reaches here is
+// DEL, UNLINK and MSET: commands whose arguments after the name are groups
+// of Step, each beginning with its key, and whose keys are independent of
+// one another.
+//
+// Anything else is refused rather than guessed at. A command that needs
+// splitting and does not fit this shape is a correctness problem that must
+// be looked at, not one to paper over with a partial application.
+func (r *Replayer) splitKeys(d *Descriptor, args [][]byte, engineDB *engine.DB,
+	db int, offset uint64) ([][]byte, error) {
+
+	step := d.Step
+	if step <= 0 {
+		step = 1
+	}
+	if d.FirstKey != 1 || d.LastKey != -1 || (len(args)-1)%step != 0 {
+		return nil, fmt.Errorf("replay: %s spans shards that were snapshotted at "+
+			"different offsets and cannot be split by its key specification "+
+			"(first=%d last=%d step=%d); see docs/design-notes.md issue 1",
+			d.FullName(), d.FirstKey, d.LastKey, step)
+	}
+
+	r.split = append(r.split[:0], args[0])
+	for i := 1; i < len(args); i += step {
+		if offset >= r.anchorOf(db, engineDB.ShardIndexOf(args[i])) {
+			r.split = append(r.split, args[i:i+step]...)
+		}
+	}
+	if len(r.split) == 1 {
+		return nil, nil
+	}
+	return r.split, nil
 }
 
 // Describe renders a record for an error message or a log line, truncating
