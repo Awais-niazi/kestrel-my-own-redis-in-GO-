@@ -134,6 +134,14 @@ func (r *Reader) Record() Record { return r.rec }
 // Recovery truncates a damaged log to this point.
 func (r *Reader) Offset() uint64 { return r.off }
 
+// Base is the stream offset of this file's first record.
+func (r *Reader) Base() uint64 { return r.base }
+
+// FileSize is the length the file would have if it ended where the last good
+// record ended. Truncating a damaged log to this cuts away exactly the part
+// that could not be read.
+func (r *Reader) FileSize() int64 { return int64(r.off-r.base) + fileHeaderSize }
+
 // Err reports why iteration stopped. It is nil at a clean end of log, and
 // wraps ErrTornTail or ErrCorrupt otherwise.
 //

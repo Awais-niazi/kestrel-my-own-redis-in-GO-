@@ -160,6 +160,7 @@ type Keyspace struct {
 	sink    atomic.Pointer[EffectSink]
 	watcher atomic.Pointer[KeyWatcher]
 	replica atomic.Bool
+	loading atomic.Bool
 	limits  limitsHolder
 
 	stopOnce sync.Once
@@ -251,6 +252,37 @@ func (ks *Keyspace) SetReplica(v bool) { ks.replica.Store(v) }
 
 // IsReplica reports whether the keyspace is in replica mode.
 func (ks *Keyspace) IsReplica() bool { return ks.replica.Load() }
+
+// SetLoading suspends expiration entirely while a log is being replayed.
+//
+// This is a third behaviour, distinct from both normal operation and replica
+// mode, and it is needed for correctness rather than for speed.
+//
+// Replaying a log means re-executing writes the leader performed in the
+// past, against a clock that is now. A record that set a TTL sets one that
+// has already elapsed, so by the time the next record arrives the key looks
+// expired -- and the leader, when it ran that next record, was working on a
+// key that was still alive. A log holding
+//
+//	PEXPIREAT k <t>
+//	APPEND k more
+//	DEL k            (emitted when the key actually expired at t)
+//
+// replays as an APPEND to a key that recovery has already made vanish, so
+// the recovered value is "more" where the leader had "originalmore". The
+// same divergence arrives whether the key is deleted or merely hidden, which
+// is why replica mode is not enough: hiding it still makes APPEND create a
+// fresh key.
+//
+// While loading, an expired key is returned as it is. Every removal comes
+// from the log, where the leader recorded it, and the recovered keyspace
+// therefore matches the leader's at the instant the log ends. Clearing the
+// flag lets the ordinary lazy and active paths reap whatever is genuinely
+// past due.
+func (ks *Keyspace) SetLoading(v bool) { ks.loading.Store(v) }
+
+// IsLoading reports whether a log is being replayed into this keyspace.
+func (ks *Keyspace) IsLoading() bool { return ks.loading.Load() }
 
 func (ks *Keyspace) emit(db int, args ...[]byte) {
 	if p := ks.sink.Load(); p != nil {
@@ -510,7 +542,7 @@ func (db *DB) lookup(s *shard, key []byte) *Object {
 	if o == nil {
 		return nil
 	}
-	if o.ExpireAt > 0 && o.ExpireAt <= db.ks.Now() {
+	if db.ks.expired(o) {
 		if db.ks.IsReplica() {
 			// Hide it, but let the leader's DEL do the deleting (FR-3.4).
 			return nil
@@ -610,7 +642,7 @@ func (db *DB) Size() int64 {
 	for _, s := range db.shards {
 		n += int64(len(s.dict))
 		for k := range s.expires {
-			if o := s.dict[k]; o != nil && o.ExpireAt > 0 && o.ExpireAt <= now {
+			if o := s.dict[k]; o != nil && db.ks.expiredAt(o, now) {
 				n--
 			}
 		}

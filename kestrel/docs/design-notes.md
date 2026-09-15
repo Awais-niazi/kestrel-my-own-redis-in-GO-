@@ -300,3 +300,75 @@ so an offset a snapshot recorded before a compaction still names the same
 point afterwards. Restarting the counter per file would invalidate every
 snapshot anchor on the first rewrite, which is the moment those anchors
 matter most.
+
+---
+
+## 8. Replay needs a third expiry mode, and the convergence test needed a skewed clock
+
+Two findings from building recovery, one a design gap and one a real bug the
+first was needed to expose.
+
+### Loading mode
+
+Replaying a log re-executes writes the leader performed in the past against a
+clock that is now, so every TTL in the log has usually already elapsed. A log
+holding
+
+```
+PEXPIREAT k <t>
+APPEND k more
+DEL k              # emitted when the key actually expired at t
+```
+
+replays as an `APPEND` to a key recovery has already made vanish, so the
+recovered value is `more` where the leader had `originalmore`.
+
+Replica mode is not enough. It *hides* an expired key rather than deleting
+it (FR-3.4), and a hidden key is a missing key to the next write in the log:
+`APPEND` still creates a fresh one. So there is a third mode,
+`Keyspace.SetLoading`, in which expiration does not happen at all. Every
+removal comes from the log, where the leader recorded it, and the recovered
+keyspace matches the leader's at the instant the log ends. Clearing the flag
+hands the remainder to the ordinary lazy and active paths.
+
+`DB.Expire` needed the same treatment, for a less obvious reason: a TTL at or
+before the present *deletes* the key. That is correct online, and wrong
+during a replay where every timestamp is in the past by definition. The
+leader propagated `DEL` rather than `PEXPIREAT` for the keys it really
+expired, so the log already says which ones go.
+
+This turned eight scattered `o.ExpireAt > 0 && o.ExpireAt <= now` conditions
+into one `Keyspace.expiredAt`. Eight places to remember a new mode is eight
+ways for a recovered keyspace to differ from the log that produced it.
+
+### The bug: `INCRBYFLOAT` was making expiring keys permanent
+
+`INCRBYFLOAT` cannot be logged verbatim, because float accumulation would
+drift on replay, so it is canonicalized to `SET key <result>` (ADR-008). But
+`INCRBYFLOAT` leaves a key's expiry alone and a plain `SET` clears it. The
+log therefore asserted "this key is permanent" about a key that was not.
+
+The consequence was not a wrong value. It was that every replica and every
+restart quietly resurrected keys that should have expired, for as long as
+they were still being incremented. The fix is one argument -- `KEEPTTL` --
+and the audit that followed found no second instance: `SPOP`→`SREM`,
+`ZINCRBY`→`ZADD`, `HINCRBYFLOAT`→`HSET`, `MSETNX`→`MSET` and the `GETEX`
+family all rewrite to commands with the same expiry semantics as the
+original.
+
+### Why `TestFollowerConverges` missed it for two milestones
+
+The convergence test runs leader and follower on the *same clock*. Both
+therefore cleared the TTL, both kept the key, and the two agreed --
+incorrectly, and invisibly.
+
+The recovery test that found it does the one thing the replication test
+cannot: it replays under a clock an hour ahead, which is what every real
+restart does. That skew turns a shared misconception into a visible
+divergence, and it found the bug on its first run.
+
+The lesson generalizes past this one command. **A differential test whose two
+sides share an input cannot see a bug in how that input is used.** The clock
+was the shared input here; the same argument applies to a shared random seed,
+a shared configuration snapshot, and a shared command table. Where a
+production pair would differ, the test pair should differ too.

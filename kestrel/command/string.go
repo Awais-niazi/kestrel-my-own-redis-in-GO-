@@ -467,7 +467,11 @@ func cmdIncrByFloat(c *Ctx) resp.Value {
 	c.Dirty(1)
 	// Float accumulation must not drift on replay, so the computed result is
 	// logged rather than the increment (ADR-008).
-	c.Propagate(effSET, c.Arg(1), rendered)
+	//
+	// KEEPTTL is not optional here. INCRBYFLOAT leaves a key's expiry alone,
+	// but a plain SET clears it, so logging one as the other would quietly
+	// make an expiring key permanent on every replica and on every restart.
+	c.Propagate(effSET, c.Arg(1), rendered, effKEEPTTL)
 	return resp.Bulk(rendered)
 }
 

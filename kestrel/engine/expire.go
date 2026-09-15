@@ -12,6 +12,23 @@ import "time"
 // either a timer per key or a global priority queue, both of which trade the
 // leak for a latency cliff.
 
+// expired reports whether o is past due.
+func (ks *Keyspace) expired(o *Object) bool {
+	return o.ExpireAt != 0 && ks.expiredAt(o, ks.Now())
+}
+
+// expiredAt reports whether o is past due at now, which loops hoist out of
+// the iteration.
+//
+// This is the only place the question is answered. It was eight separate
+// conditions before loading mode existed, and eight places to forget it is
+// eight ways for a recovered keyspace to differ from the log that produced
+// it. The clock comparison short-circuits first, so a key with no TTL never
+// reaches the atomic load.
+func (ks *Keyspace) expiredAt(o *Object, now int64) bool {
+	return o.ExpireAt != 0 && o.ExpireAt <= now && !ks.loading.Load()
+}
+
 // ExpireFlags constrains when a TTL update applies, matching the NX/XX/GT/LT
 // options of EXPIRE.
 type ExpireFlags uint8
@@ -42,7 +59,11 @@ func (db *DB) Expire(key []byte, atMS int64, flags ExpireFlags) (applied, delete
 		return false, false
 	}
 	k := string(key)
-	if atMS <= db.ks.Now() {
+	// A TTL at or before the present deletes the key -- except while a log
+	// is being replayed, where every timestamp in it is in the past by
+	// definition. The leader propagated DEL rather than PEXPIREAT for the
+	// keys it actually expired, so the log already says which ones go.
+	if atMS <= db.ks.Now() && !db.ks.IsLoading() {
 		db.removeLocked(s, k, o)
 		db.touched(key)
 		return true, true
@@ -144,8 +165,10 @@ func (ks *Keyspace) activeExpireCycle() {
 		case <-ks.stop:
 			return
 		case <-ticker.C:
-			// Replicas never expire on their own clock (FR-3.4).
-			if ks.IsReplica() {
+			// Replicas never expire on their own clock (FR-3.4), and a
+			// keyspace being loaded from a log expires nothing at all
+			// (Keyspace.SetLoading).
+			if ks.IsReplica() || ks.IsLoading() {
 				continue
 			}
 			ks.ExpirePass(time.Now().Add(budget))
@@ -158,6 +181,9 @@ func (ks *Keyspace) activeExpireCycle() {
 //
 // It returns the number of keys reaped.
 func (ks *Keyspace) ExpirePass(deadline time.Time) int {
+	if ks.IsLoading() {
+		return 0
+	}
 	sample := ks.opts.ActiveExpireSampleSize
 	total := 0
 	for _, db := range ks.dbs {
@@ -206,7 +232,7 @@ func (db *DB) expireSample(s *shard, n int) (checked, expired int) {
 			continue
 		}
 		checked++
-		if o.ExpireAt > 0 && o.ExpireAt <= now {
+		if db.ks.expiredAt(o, now) {
 			db.expireKey(s, k, o)
 			expired++
 		}

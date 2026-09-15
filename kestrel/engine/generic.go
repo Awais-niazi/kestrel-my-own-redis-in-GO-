@@ -147,7 +147,7 @@ func (db *DB) RandomKey() []byte {
 		s.mu.Lock()
 		for k := range s.dict {
 			o := s.dict[k]
-			if o.ExpireAt > 0 && o.ExpireAt <= db.ks.Now() {
+			if db.ks.expired(o) {
 				continue
 			}
 			s.mu.Unlock()
@@ -172,7 +172,7 @@ func (db *DB) Keys(pattern []byte) [][]byte {
 	for _, s := range db.shards {
 		s.mu.Lock()
 		for k, o := range s.dict {
-			if o.ExpireAt > 0 && o.ExpireAt <= now {
+			if db.ks.expiredAt(o, now) {
 				continue
 			}
 			if all || MatchPattern(pattern, []byte(k)) {
@@ -226,7 +226,7 @@ func (db *DB) Scan(cursor uint64, opts ScanOptions) (uint64, [][]byte) {
 		s := db.shards[i]
 		s.mu.Lock()
 		for k, o := range s.dict {
-			if o.ExpireAt > 0 && o.ExpireAt <= now {
+			if db.ks.expiredAt(o, now) {
 				continue
 			}
 			if opts.TypeFilter && o.Type != opts.Type {

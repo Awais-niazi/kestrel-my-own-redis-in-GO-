@@ -57,10 +57,10 @@ func TestEffectCanonicalization(t *testing.T) {
 		{"APPEND is logged verbatim", []string{"APPEND", "app", "xy"}, []string{"APPEND app xy"}},
 		{"SETRANGE is logged verbatim",
 			[]string{"SETRANGE", "app", "1", "z"}, []string{"SETRANGE app 1 z"}},
-		{"INCRBYFLOAT is logged as its result",
-			[]string{"INCRBYFLOAT", "flt", "1.5"}, []string{"SET flt 1.5"}},
+		{"INCRBYFLOAT is logged as its result, keeping the TTL a SET would clear",
+			[]string{"INCRBYFLOAT", "flt", "1.5"}, []string{"SET flt 1.5 KEEPTTL"}},
 		{"INCRBYFLOAT accumulates in the log too",
-			[]string{"INCRBYFLOAT", "flt", "0.1"}, []string{"SET flt 1.6"}},
+			[]string{"INCRBYFLOAT", "flt", "0.1"}, []string{"SET flt 1.6 KEEPTTL"}},
 		{"EXPIRE becomes PEXPIREAT",
 			[]string{"EXPIRE", "a", "60"}, []string{"PEXPIREAT a " + abs(60_000)}},
 		{"PEXPIRE becomes PEXPIREAT",
@@ -268,14 +268,125 @@ func TestFollowerConverges(t *testing.T) {
 	}
 	leader.mu.Unlock()
 
-	s := newSession(t, leader)
-	rng := rand.New(rand.NewSource(20240914))
-	for i := 0; i < 12000; i++ {
+	randomWorkload(t, leader, 20240914, 12000)
+
+	if applied == 0 {
+		t.Fatal("no effects were replicated")
+	}
+	t.Logf("replicated %d effects", applied)
+
+	want := dump(t, leader)
+	got := dump(t, follower)
+	if want != got {
+		t.Errorf("leader and follower diverged at %s", firstDiff(want, got))
+	}
+}
+
+// dump renders the whole visible dataset of a host as text, for comparison.
+func dump(t *testing.T, h *testHost) string {
+	t.Helper()
+	s := newSession(t, h)
+	var b strings.Builder
+	for i := 0; i < h.ks.NumDatabases(); i++ {
+		if !s.cl.Select(h.ks, i) {
+			t.Fatal("select failed")
+		}
+		keys := s.do("KEYS", "*")
+		names := make([]string, 0, len(keys.Elems))
+		for _, k := range keys.Elems {
+			names = append(names, string(k.Str))
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			typ := str(s.do("TYPE", k))
+			fmt.Fprintf(&b, "db%d %q type=%s value=%s pttl=%s\n",
+				i, k, typ, dumpValue(s, typ, k), str(s.do("PTTL", k)))
+		}
+	}
+	return b.String()
+}
+
+// dumpValue renders a value in a form that is identical on two nodes holding
+// the same data. Hash and set members have no defined order, so they are
+// sorted; list and sorted set order is meaningful and is left alone.
+func dumpValue(s *session, typ, key string) string {
+	switch typ {
+	case "string":
+		return str(s.do("GET", key))
+	case "list":
+		return str(s.do("LRANGE", key, "0", "-1"))
+	case "hash":
+		return sortedPairs(str(s.do("HGETALL", key)))
+	case "set":
+		return sortedTokens(str(s.do("SMEMBERS", key)))
+	case "zset":
+		return str(s.do("ZRANGE", key, "0", "-1", "WITHSCORES"))
+	default:
+		return "<unknown type>"
+	}
+}
+
+// sortedTokens sorts a bracketed reply so that unordered collections compare
+// equal regardless of iteration order.
+func sortedTokens(v string) string {
+	inner := strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
+	if inner == "" {
+		return "[]"
+	}
+	f := strings.Fields(inner)
+	sort.Strings(f)
+	return "[" + strings.Join(f, " ") + "]"
+}
+
+// sortedPairs sorts a flat field/value reply by field.
+func sortedPairs(v string) string {
+	inner := strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
+	if inner == "" {
+		return "[]"
+	}
+	f := strings.Fields(inner)
+	pairs := make([]string, 0, len(f)/2)
+	for i := 0; i+1 < len(f); i += 2 {
+		pairs = append(pairs, f[i]+"="+f[i+1])
+	}
+	sort.Strings(pairs)
+	return "[" + strings.Join(pairs, " ") + "]"
+}
+
+func firstDiff(a, b string) string {
+	la, lb := strings.Split(a, "\n"), strings.Split(b, "\n")
+	for i := 0; i < len(la) || i < len(lb); i++ {
+		var x, y string
+		if i < len(la) {
+			x = la[i]
+		}
+		if i < len(lb) {
+			y = lb[i]
+		}
+		if x != y {
+			return fmt.Sprintf("line %d:\n  leader:   %s\n  follower: %s", i+1, x, y)
+		}
+	}
+	return "(identical)"
+}
+
+// randomWorkload drives a broad randomized write stream against a host.
+//
+// It is shared by the replication and the recovery convergence tests. Both
+// ask the same question of the effect stream -- does replaying it rebuild
+// the dataset exactly -- and they must ask it of the same writes, or a
+// command whose effect is wrong will be caught by one and missed by the
+// other.
+func randomWorkload(t *testing.T, h *testHost, seed int64, iterations int) {
+	t.Helper()
+	s := newSession(t, h)
+	rng := rand.New(rand.NewSource(seed))
+	for i := 0; i < iterations; i++ {
 		if i%500 == 0 {
 			// Move time forward so that TTLs actually elapse and the lazy
 			// and active expiry paths both produce DELs.
-			leader.now.Add(rng.Int63n(40_000))
-			leader.ks.ExpirePass(farFuture())
+			h.now.Add(rng.Int63n(40_000))
+			h.ks.ExpirePass(farFuture())
 		}
 		k := fmt.Sprintf("k%d", rng.Intn(60))
 		// Collection keys are kept in their own namespaces, because a
@@ -394,104 +505,5 @@ func TestFollowerConverges(t *testing.T) {
 		s.do("GET", k)
 		s.do("EXISTS", lk, hk, sk, zk)
 	}
-	leader.ks.ExpirePass(farFuture())
-
-	if applied == 0 {
-		t.Fatal("no effects were replicated")
-	}
-	t.Logf("replicated %d effects", applied)
-
-	want := dump(t, leader)
-	got := dump(t, follower)
-	if want != got {
-		t.Errorf("leader and follower diverged at %s", firstDiff(want, got))
-	}
-}
-
-// dump renders the whole visible dataset of a host as text, for comparison.
-func dump(t *testing.T, h *testHost) string {
-	t.Helper()
-	s := newSession(t, h)
-	var b strings.Builder
-	for i := 0; i < h.ks.NumDatabases(); i++ {
-		if !s.cl.Select(h.ks, i) {
-			t.Fatal("select failed")
-		}
-		keys := s.do("KEYS", "*")
-		names := make([]string, 0, len(keys.Elems))
-		for _, k := range keys.Elems {
-			names = append(names, string(k.Str))
-		}
-		sort.Strings(names)
-		for _, k := range names {
-			typ := str(s.do("TYPE", k))
-			fmt.Fprintf(&b, "db%d %q type=%s value=%s pttl=%s\n",
-				i, k, typ, dumpValue(s, typ, k), str(s.do("PTTL", k)))
-		}
-	}
-	return b.String()
-}
-
-// dumpValue renders a value in a form that is identical on two nodes holding
-// the same data. Hash and set members have no defined order, so they are
-// sorted; list and sorted set order is meaningful and is left alone.
-func dumpValue(s *session, typ, key string) string {
-	switch typ {
-	case "string":
-		return str(s.do("GET", key))
-	case "list":
-		return str(s.do("LRANGE", key, "0", "-1"))
-	case "hash":
-		return sortedPairs(str(s.do("HGETALL", key)))
-	case "set":
-		return sortedTokens(str(s.do("SMEMBERS", key)))
-	case "zset":
-		return str(s.do("ZRANGE", key, "0", "-1", "WITHSCORES"))
-	default:
-		return "<unknown type>"
-	}
-}
-
-// sortedTokens sorts a bracketed reply so that unordered collections compare
-// equal regardless of iteration order.
-func sortedTokens(v string) string {
-	inner := strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
-	if inner == "" {
-		return "[]"
-	}
-	f := strings.Fields(inner)
-	sort.Strings(f)
-	return "[" + strings.Join(f, " ") + "]"
-}
-
-// sortedPairs sorts a flat field/value reply by field.
-func sortedPairs(v string) string {
-	inner := strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
-	if inner == "" {
-		return "[]"
-	}
-	f := strings.Fields(inner)
-	pairs := make([]string, 0, len(f)/2)
-	for i := 0; i+1 < len(f); i += 2 {
-		pairs = append(pairs, f[i]+"="+f[i+1])
-	}
-	sort.Strings(pairs)
-	return "[" + strings.Join(pairs, " ") + "]"
-}
-
-func firstDiff(a, b string) string {
-	la, lb := strings.Split(a, "\n"), strings.Split(b, "\n")
-	for i := 0; i < len(la) || i < len(lb); i++ {
-		var x, y string
-		if i < len(la) {
-			x = la[i]
-		}
-		if i < len(lb) {
-			y = lb[i]
-		}
-		if x != y {
-			return fmt.Sprintf("line %d:\n  leader:   %s\n  follower: %s", i+1, x, y)
-		}
-	}
-	return "(identical)"
+	h.ks.ExpirePass(farFuture())
 }
