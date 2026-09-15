@@ -129,3 +129,15 @@ the generic unknown-command error. Attempts are counted in
 `unsupported_command_attempts` and exported as
 `kestrel_unsupported_commands_total`, which is the metric that should drive
 what gets built next (R4).
+
+## `snapshot-batch-keys` bounds record size, not the lock hold
+
+The name suggests the snapshotter processes a shard in batches of keys,
+releasing the shard lock between them. It does not, and cannot: a write
+arriving between two batches would be visible in one and not the other while
+both are covered by a single anchor offset, which makes recovery replay that
+write on top of a value that already contains it.
+
+The directive instead caps how many collection elements go into one rebuild
+command, which bounds the size of a single record. The reasoning, and what
+the resulting pause actually costs, are in `docs/design-notes.md` issue 9.

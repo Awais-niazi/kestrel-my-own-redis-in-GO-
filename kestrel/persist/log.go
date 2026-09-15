@@ -105,7 +105,7 @@ func Create(opts Options) (*Log, error) {
 		Base:    opts.Base,
 		Created: uint64(time.Now().UnixMilli()),
 	}
-	if _, err := f.Write(h.encode()); err != nil {
+	if _, err := f.Write(h.encode(logMagic)); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -140,7 +140,7 @@ func Open(opts Options) (*Log, error) {
 		f.Close()
 		return nil, fmt.Errorf("persist: reading header of %s: %w", opts.Path, err)
 	}
-	h, err := decodeFileHeader(hb[:])
+	h, err := decodeFileHeader(hb[:], logMagic)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("persist: %s: %w", opts.Path, err)
@@ -183,7 +183,7 @@ func (l *Log) Append(db int, args [][]byte) (uint64, error) {
 	if n := recordSize(args); cap(l.buf) < n {
 		l.buf = make([]byte, 0, n)
 	}
-	l.buf = encodeRecord(l.buf[:0], db, args)
+	l.buf = encodeRecord(l.buf[:0], db, KindEffect, args)
 
 	at := l.offset
 	if _, err := l.f.Write(l.buf); err != nil {
@@ -318,7 +318,7 @@ func (l *Log) baseLocked() (uint64, error) {
 	if _, err := l.f.ReadAt(hb[:], 0); err != nil {
 		return 0, err
 	}
-	h, err := decodeFileHeader(hb[:])
+	h, err := decodeFileHeader(hb[:], logMagic)
 	return h.Base, err
 }
 

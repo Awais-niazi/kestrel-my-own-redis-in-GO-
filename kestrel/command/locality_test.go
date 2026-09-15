@@ -55,8 +55,17 @@ func TestWriteCommandsDeclareLocality(t *testing.T) {
 // declares FirstKey and LastKey of 1, naming only its destination -- so the
 // property is a statement about what the handler does, and the only honest
 // check is that the list and the table agree.
+//
+// FLUSHDB and FLUSHALL are here for a slightly different reason than the
+// rest. They read nothing, but they write every shard at once, so one landing
+// inside a snapshot window leaves the shards serialized after it already
+// flushed and the ones before it not. Recovery would then have to apply a
+// flush to some shards and not others. Excluding them keeps the filter
+// working on whole commands.
 var crossShardCommands = []string{
 	"COPY",
+	"FLUSHALL",
+	"FLUSHDB",
 	"LMOVE",
 	"MSETNX",
 	"RENAME",

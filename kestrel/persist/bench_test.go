@@ -51,6 +51,6 @@ func BenchmarkEncodeRecord(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf = encodeRecord(buf[:0], 0, args)
+		buf = encodeRecord(buf[:0], 0, KindEffect, args)
 	}
 }

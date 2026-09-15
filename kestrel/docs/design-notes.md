@@ -372,3 +372,72 @@ sides share an input cannot see a bug in how that input is used.** The clock
 was the shared input here; the same argument applies to a shared random seed,
 a shared configuration snapshot, and a shared command table. Where a
 production pair would differ, the test pair should differ too.
+
+---
+
+## 9. The snapshot holds a shard lock for the whole shard, and that is a real pause
+
+### Why the lock cannot be released part-way through a shard
+
+ADR-009's "chunked" means the chunks are shards. A shard is serialized under
+one hold of its lock, and the log offset at that moment becomes its anchor.
+
+It is tempting to release the lock between batches of keys inside a shard,
+because `snapshot-batch-keys` sounds like it is asking for exactly that. It
+is not safe. A write arriving between two batches is visible in the second
+and not the first, while the anchor names a single offset for both -- so
+recovery, seeing that write at an offset after the anchor, replays it on top
+of a value that already contains it. For `SET` that is redundant. For `INCR`,
+`APPEND` or `RPUSH` it is a wrong value.
+
+So `snapshot-batch-keys` is reinterpreted: it caps how many collection
+elements go into one rebuild command, bounding record size. It does not
+bound the lock hold. This is a deviation from what the name suggests and is
+recorded in `docs/deviations.md`.
+
+### What it costs
+
+`BenchmarkWriteSnapshot` walks 20,000 keys plus 400 collections in 7.2 ms
+with 501 allocations total -- about 2.8M keys/second, and the allocations are
+per shard and per collection copy rather than per key. The walker itself is
+cheap.
+
+The pause is not. At that rate a 10M-key dataset takes ~3.6 s to serialize,
+and with 16 shards that is **~220 ms during which one sixteenth of the
+keyspace is blocked**. Commands hashing to other shards run normally, so this
+is not a full stop, but it is far past the p99.9 budget in §8.1 for the
+shard it lands on.
+
+Three ways out, in increasing order of cost to build:
+
+1. **Raise the shard count.** The pause divides by it. 256 shards puts the
+   same dataset at ~14 ms per shard. This is nearly free and should be the
+   first answer; ADR-003's shard count was chosen for lock contention, not
+   for snapshot latency, and the two want the same thing.
+2. **Copy the shard under the lock and serialize outside it.** Turns a long
+   CPU hold into a short one plus a memory spike of one shard's worth of
+   deep copies. Cheaper in latency, worse in peak memory, and it needs a
+   real `Clone` for every collection type.
+3. **Fork, and let the kernel do copy-on-write**, which is what the
+   reference implementation does. It removes the pause almost entirely and
+   costs a page-table copy plus unbounded memory growth under a write-heavy
+   load. It is also awkward in Go, where a fork without exec is not
+   supported for a multi-threaded runtime.
+
+Option 1 is the recommendation and needs a measurement, not a rewrite.
+Nothing here is urgent while `snapshot-interval` defaults to 900 s, but the
+number should be known before anyone turns it down.
+
+### Why a snapshot reuses the log's framing
+
+A snapshot is a sequence of framed records in the same format as the log:
+rebuild commands, interleaved with anchors that name the offset each shard
+was taken at. Anchors travel as a distinct `RecordKind` rather than as a
+specially named command, so replay cannot be talked into executing one.
+
+The payoff is that one checksum, one decoder and one fuzz target cover both
+files, and recovery is one function rather than two. The cost is size and
+load speed: a sorted set is stored as `ZADD` arguments where a packed binary
+encoding would be smaller. For a dataset that fits in memory by definition,
+the format is not the bottleneck -- and the alternative is a second binary
+format with its own corruption modes to get right.

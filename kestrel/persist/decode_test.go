@@ -47,7 +47,7 @@ func TestRecordSizeMatchesEncoding(t *testing.T) {
 	cases = append(cases, many)
 
 	for i, args := range cases {
-		enc := encodeRecord(nil, 0, args)
+		enc := encodeRecord(nil, 0, KindEffect, args)
 		if got := recordSize(args); got != len(enc) {
 			t.Errorf("case %d (%d args): recordSize %d, encoded %d", i, len(args), got, len(enc))
 		}

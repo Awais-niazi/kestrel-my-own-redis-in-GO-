@@ -41,7 +41,11 @@ import (
 // has to be read before it can be checked, which is why it is bounded by
 // MaxRecordSize and by the bytes remaining in the file.
 const (
-	fileMagic        = "KESTRLOG"
+	// logMagic and snapshotMagic distinguish the two file kinds. They share
+	// a framing, a checksum and a decoder, and differ in what the records
+	// mean, so opening one as the other has to fail rather than half work.
+	logMagic         = "KESTRLOG"
+	snapshotMagic    = "KESTRSNP"
 	fileVersion      = 1
 	fileHeaderSize   = 32
 	recordHeaderSize = 12
@@ -49,6 +53,24 @@ const (
 	// MaxRecordSize bounds the payload of a single record. A record larger
 	// than this is treated as corruption rather than allocated for.
 	MaxRecordSize = 512 << 20
+)
+
+// RecordKind distinguishes the payloads a file can hold. It travels in the
+// record header's flags field.
+//
+// Keeping anchors in the same stream as effects means one framing, one
+// checksum and one decoder for both. Keeping them in a separate *kind* means
+// replay can never be talked into executing one as a command, however well
+// formed it looks.
+type RecordKind uint16
+
+// Record kinds.
+const (
+	// KindEffect is a command to be replayed.
+	KindEffect RecordKind = iota
+	// KindAnchor records the log offset a shard was serialized at. It
+	// appears only in a snapshot.
+	KindAnchor
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -80,9 +102,9 @@ type fileHeader struct {
 	Created uint64 // unix milliseconds
 }
 
-func (h fileHeader) encode() []byte {
+func (h fileHeader) encode(magic string) []byte {
 	b := make([]byte, fileHeaderSize)
-	copy(b, fileMagic)
+	copy(b, magic)
 	binary.LittleEndian.PutUint16(b[8:], h.Version)
 	binary.LittleEndian.PutUint16(b[10:], h.Flags)
 	binary.LittleEndian.PutUint64(b[12:], h.Base)
@@ -91,13 +113,13 @@ func (h fileHeader) encode() []byte {
 	return b
 }
 
-func decodeFileHeader(b []byte) (fileHeader, error) {
+func decodeFileHeader(b []byte, magic string) (fileHeader, error) {
 	var h fileHeader
 	if len(b) < fileHeaderSize {
 		return h, ErrBadHeader
 	}
-	if string(b[:8]) != fileMagic {
-		return h, ErrBadHeader
+	if got := string(b[:8]); got != magic {
+		return h, fmt.Errorf("%w: header says %q, expected %q", ErrBadHeader, got, magic)
 	}
 	if got := binary.LittleEndian.Uint32(b[28:]); got != crc32.Checksum(b[:28], crcTable) {
 		return h, fmt.Errorf("%w: header checksum mismatch", ErrCorrupt)
@@ -115,7 +137,7 @@ func decodeFileHeader(b []byte) (fileHeader, error) {
 // encodeRecord appends one framed record for args to dst and returns the
 // extended slice. The caller reuses dst across appends, so a write costs no
 // allocation once the buffer has grown.
-func encodeRecord(dst []byte, db int, args [][]byte) []byte {
+func encodeRecord(dst []byte, db int, kind RecordKind, args [][]byte) []byte {
 	start := len(dst)
 	dst = append(dst, zeroHeader[:]...)
 	payloadStart := len(dst)
@@ -125,7 +147,7 @@ func encodeRecord(dst []byte, db int, args [][]byte) []byte {
 	h := dst[start : start+recordHeaderSize]
 	binary.LittleEndian.PutUint32(h[0:], uint32(n))
 	binary.LittleEndian.PutUint16(h[4:], uint16(db))
-	binary.LittleEndian.PutUint16(h[6:], 0)
+	binary.LittleEndian.PutUint16(h[6:], uint16(kind))
 	sum := crc32.Update(crc32.Checksum(h[:8], crcTable), crcTable, dst[payloadStart:])
 	binary.LittleEndian.PutUint32(h[8:], sum)
 	return dst

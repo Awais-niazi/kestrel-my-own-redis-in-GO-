@@ -18,7 +18,7 @@ sorted sets, generic keyspace commands, and expiration all work.
 | M0 | RESP2 codec, TCP/TLS server, connection handling, config, fuzz harness | done |
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
-| M3 | Append log, snapshots, recovery, compaction | in progress: log and recovery done, not yet wired |
+| M3 | Append log, snapshots, recovery, compaction | in progress: log, snapshots and recovery done, not yet wired |
 | M4 | Replication | not started |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
@@ -28,8 +28,8 @@ sorted sets, generic keyspace commands, and expiration all work.
 
 The configuration accepts `appendonly` and `snapshot-interval` so that a
 production config file loads unchanged, and `persist/` now holds a working
-append log and a working recovery pass, but **the server does not open
-either yet**. Data lives in memory only and is lost on restart. The server
+append log, a working snapshotter and a working recovery pass, but **the
+server does not open any of them yet**. Data lives in memory only and is lost on restart. The server
 says so in its startup log, every time, and will keep saying so until the
 two are wired together.
 

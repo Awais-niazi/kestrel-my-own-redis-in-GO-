@@ -13,12 +13,12 @@ import (
 // accepts a connection, so a panic here is a server that cannot start.
 func FuzzReader(f *testing.F) {
 	var good bytes.Buffer
-	good.Write(fileHeader{Version: fileVersion}.encode())
-	good.Write(encodeRecord(nil, 0, cmd("SET", "a", "1")))
-	good.Write(encodeRecord(nil, 9, cmd("DEL", "a")))
+	good.Write(fileHeader{Version: fileVersion}.encode(logMagic))
+	good.Write(encodeRecord(nil, 0, KindEffect, cmd("SET", "a", "1")))
+	good.Write(encodeRecord(nil, 9, KindEffect, cmd("DEL", "a")))
 	f.Add(good.Bytes())
 	f.Add(good.Bytes()[:len(good.Bytes())-3]) // torn tail
-	f.Add(fileHeader{Version: fileVersion}.encode())
+	f.Add(fileHeader{Version: fileVersion}.encode(logMagic))
 	f.Add([]byte("KESTRLOG"))
 	f.Add([]byte{})
 
@@ -57,13 +57,13 @@ func FuzzRecordRoundTrip(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, a, b, c string) {
 		args := [][]byte{[]byte(a), []byte(b), []byte(c)}
-		enc := encodeRecord(nil, 7, args)
+		enc := encodeRecord(nil, 7, KindEffect, args)
 		if got := recordSize(args); got != len(enc) {
 			t.Fatalf("recordSize said %d, encoding took %d", got, len(enc))
 		}
 
 		var buf bytes.Buffer
-		buf.Write(fileHeader{Version: fileVersion}.encode())
+		buf.Write(fileHeader{Version: fileVersion}.encode(logMagic))
 		buf.Write(enc)
 
 		r, err := NewReader(&buf)

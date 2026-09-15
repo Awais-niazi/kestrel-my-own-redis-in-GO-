@@ -18,6 +18,7 @@ import (
 // copy.
 type Record struct {
 	DB     int
+	Kind   RecordKind
 	Args   [][]byte
 	Offset uint64 // stream offset of this record
 	Size   int    // encoded size, header included
@@ -36,7 +37,13 @@ type Reader struct {
 
 // NewReader validates a log file header and returns a reader positioned at
 // the first record.
-func NewReader(src io.Reader) (*Reader, error) {
+func NewReader(src io.Reader) (*Reader, error) { return newReader(src, logMagic) }
+
+// NewSnapshotReader validates a snapshot file header and returns a reader
+// positioned at the first record.
+func NewSnapshotReader(src io.Reader) (*Reader, error) { return newReader(src, snapshotMagic) }
+
+func newReader(src io.Reader, magic string) (*Reader, error) {
 	br := bufio.NewReaderSize(src, 64<<10)
 	var hb [fileHeaderSize]byte
 	if _, err := io.ReadFull(br, hb[:]); err != nil {
@@ -45,7 +52,7 @@ func NewReader(src io.Reader) (*Reader, error) {
 		}
 		return nil, err
 	}
-	h, err := decodeFileHeader(hb[:])
+	h, err := decodeFileHeader(hb[:], magic)
 	if err != nil {
 		return nil, err
 	}
@@ -54,12 +61,20 @@ func NewReader(src io.Reader) (*Reader, error) {
 
 // OpenReader opens a log file for reading. The caller closes the returned
 // file.
-func OpenReader(path string) (*Reader, *os.File, error) {
+func OpenReader(path string) (*Reader, *os.File, error) { return openReader(path, logMagic) }
+
+// OpenSnapshotReader opens a snapshot file for reading. The caller closes the
+// returned file.
+func OpenSnapshotReader(path string) (*Reader, *os.File, error) {
+	return openReader(path, snapshotMagic)
+}
+
+func openReader(path, magic string) (*Reader, *os.File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	r, err := NewReader(f)
+	r, err := newReader(f, magic)
 	if err != nil {
 		f.Close()
 		return nil, nil, fmt.Errorf("persist: %s: %w", path, err)
@@ -85,6 +100,7 @@ func (r *Reader) Next() bool {
 
 	size := int(binary.LittleEndian.Uint32(r.hdr[0:]))
 	db := int(binary.LittleEndian.Uint16(r.hdr[4:]))
+	kind := RecordKind(binary.LittleEndian.Uint16(r.hdr[6:]))
 	want := binary.LittleEndian.Uint32(r.hdr[8:])
 
 	// The length is checked before it is used to allocate. A record header
@@ -122,7 +138,7 @@ func (r *Reader) Next() bool {
 		return false
 	}
 
-	r.rec = Record{DB: db, Args: args, Offset: r.off, Size: recordHeaderSize + size}
+	r.rec = Record{DB: db, Kind: kind, Args: args, Offset: r.off, Size: recordHeaderSize + size}
 	r.off += uint64(r.rec.Size)
 	return true
 }
