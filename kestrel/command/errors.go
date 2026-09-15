@@ -96,3 +96,14 @@ func engineError(err error) resp.Value {
 		return resp.Err("ERR " + err.Error())
 	}
 }
+
+// errMisconf refuses a write because the append log is not taking them.
+//
+// The name matches the reference implementation's error for the same
+// situation, so existing client retry logic recognises it. The reason is
+// included because "MISCONF" on its own has sent many people to the wrong
+// part of their configuration.
+func errMisconf(err error) resp.Value {
+	return resp.Err("MISCONF Errors writing to the append log: " + err.Error() +
+		". Writes are refused until it recovers.")
+}

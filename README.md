@@ -42,10 +42,12 @@ M0 (skeleton), M1 (core key/value) and M2 (collections) are complete: 145
 working commands, strings, lists, hashes, sets and sorted sets with adaptive
 encodings, expiration, `SCAN`, RESP2 and RESP3, TLS, and a metrics endpoint.
 
-M3 (persistence) is in progress. The append log, the snapshotter and the
-restore path all work and are tested end to end, but the server does not yet
-open them on startup, **so nothing is durable yet** — data lives in memory
-only and is lost on restart. The server says so in its log at every start.
+M3 (persistence) is in progress and **a restart now keeps your data.** With
+`appendonly yes` the server logs the canonical effect of every write and
+rebuilds the keyspace from it on startup, TTLs included. What is still
+missing is scheduling: the snapshotter works and is tested, but nothing
+triggers it yet, so the log grows without bound and recovery replays all of
+it.
 
 The per-milestone table is in [`kestrel/README.md`](kestrel/README.md#status).
 

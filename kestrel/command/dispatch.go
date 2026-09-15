@@ -153,6 +153,13 @@ func resolve(host Host, cl *Client, args [][]byte) (*Descriptor, resp.Value) {
 			table.recordRejected(d)
 			return nil, errReadOnly
 		}
+		// A write that cannot reach the log must not be acknowledged.
+		// Accepting it would report success for data that will not survive
+		// a restart, which is worse than an outage because it looks fine.
+		if err := host.PersistenceError(); err != nil {
+			table.recordRejected(d)
+			return nil, errMisconf(err)
+		}
 		if d.Is(DenyOOM) && overMemoryLimit(host, cfg.MaxMemory, cfg.MaxMemoryPolicy) {
 			table.recordRejected(d)
 			return nil, errOOM

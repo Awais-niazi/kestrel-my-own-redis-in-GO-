@@ -55,6 +55,7 @@ type Server struct {
 	nextID    atomic.Uint64
 
 	loading atomic.Bool
+	persist *persistence
 	replica atomic.Bool
 
 	quit         chan struct{}
@@ -239,7 +240,31 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	s.warnIfExposed(snap)
-	s.warnIfNotDurable(snap)
+
+	// Recovery runs after the listeners exist and before any of them is
+	// accepted from. The ports are therefore already bound, so a client that
+	// connects during a long replay waits in the backlog rather than being
+	// refused, and the admin server's readiness probe reports the truth
+	// while it happens.
+	p, err := s.openPersistence(snap)
+	if err != nil {
+		return err
+	}
+	s.persist = p
+	if p == nil {
+		s.log.Info("persistence is disabled: data is held in memory only and " +
+			"is lost on restart")
+	} else {
+		s.loading.Store(true)
+		err := s.restore(p, snap)
+		s.loading.Store(false)
+		if err != nil {
+			return err
+		}
+		var el EffectLog = p
+		s.SetEffectLog(el)
+		s.log.Info("persistence is on", "dir", p.dir, "appendfsync", snap.AppendFsync)
+	}
 
 	for _, l := range s.listeners {
 		s.workers.Add(1)
@@ -274,24 +299,6 @@ func (s *Server) warnIfExposed(snap *config.Values) {
 	}
 }
 
-// warnIfNotDurable says, at every startup, that this build keeps nothing.
-//
-// The configuration accepts appendonly and snapshot-interval so that a
-// production config file loads unchanged, but the append log and the
-// snapshotter are M3 work and do not exist yet. An operator who reads
-// "appendonly yes" in their config and assumes their data survives a restart
-// would be wrong, and finding that out from a restart is the worst possible
-// way to learn it.
-func (s *Server) warnIfNotDurable(snap *config.Values) {
-	if snap.AppendOnly || snap.SnapshotInterval > 0 {
-		s.log.Warn("PERSISTENCE IS NOT IMPLEMENTED IN THIS BUILD: the append log and " +
-			"snapshots arrive in M3. Data is held in memory only and is lost on restart, " +
-			"regardless of the appendonly and snapshot-interval settings.")
-		return
-	}
-	s.log.Info("persistence is disabled; data is held in memory only")
-}
-
 // drain implements the graceful shutdown sequence of NFR-3: stop accepting,
 // let in-flight commands finish, flush and sync durable state, then exit.
 func (s *Server) drain(snap *config.Values) error {
@@ -320,6 +327,18 @@ func (s *Server) drain(snap *config.Values) error {
 	}
 
 	s.ks.Close()
+	if s.persist != nil {
+		// The log is closed after the connections have drained, so every
+		// effect that was acknowledged is in it, and a close that cannot
+		// force the file reports rather than swallowing the failure: this is
+		// exactly the case where an operator believes a clean shutdown was
+		// durable.
+		if err := s.persist.Close(); err != nil {
+			s.log.Error("closing the append log failed; the last writes may not "+
+				"be on disk", "error", err)
+			s.shutdownErr = err
+		}
+	}
 	s.log.Info("shutdown complete",
 		"uptime_seconds", int64(time.Since(s.startTime).Seconds()))
 	return nil

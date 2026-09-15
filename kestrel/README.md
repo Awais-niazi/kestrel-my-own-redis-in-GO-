@@ -9,38 +9,53 @@ distribution and is not affiliated with Redis Ltd.
 
 ## Status
 
-**M0 (skeleton), M1 (core key/value) and M2 (collections) are complete.** The
-server runs, real Redis clients talk to it, and strings, lists, hashes, sets,
-sorted sets, generic keyspace commands, and expiration all work.
+**M0 (skeleton), M1 (core key/value) and M2 (collections) are complete, and
+M3 (persistence) now survives a restart.** The server runs, real Redis
+clients talk to it, and strings, lists, hashes, sets, sorted sets, generic
+keyspace commands, expiration and durability all work.
 
 | Milestone | Scope | State |
 |---|---|---|
 | M0 | RESP2 codec, TCP/TLS server, connection handling, config, fuzz harness | done |
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
-| M3 | Append log, snapshots, recovery, compaction | in progress: log, snapshots and restore done, not yet wired |
+| M3 | Append log, snapshots, recovery, compaction | in progress: log and recovery live; snapshots not yet scheduled |
 | M4 | Replication | not started |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
 
-### Nothing is durable yet
+### What durability means here
 
-The configuration accepts `appendonly` and `snapshot-interval` so that a
-production config file loads unchanged, and `persist/` now holds a working
-append log, a working snapshotter and a working recovery pass, but **the
-server does not open any of them yet**. Data lives in memory only and is lost on restart. The server
-says so in its startup log, every time, and will keep saying so until the
-two are wired together.
+With `appendonly yes` the server writes the canonical effect of every write
+to an append log in `dir`, and rebuilds the keyspace from it on startup. A
+restart keeps your data, TTLs included.
 
-What does work, and is tested end to end, is the whole round trip: a
-snapshot taken while four goroutines keep writing, plus the log that ran
-underneath it, replayed into an empty keyspace and compared key by key
-against the host that produced it -- including under a clock an hour ahead,
-which is what a real restart looks like.
+```
+appendfsync always     every write is on disk before it is acknowledged
+appendfsync everysec   a crash loses at most a second; a process kill loses nothing
+appendfsync no         the operating system decides
+```
 
-The effect stream those subsystems will consume is already built and tested,
-so M3 attaches to a working propagation path rather than introducing one.
+`always` is the honest option and an expensive one: it costs a disk flush per
+command, which measured about 220 writes a second on the development host.
+`everysec` is the default.
+
+A log that cannot be read to its end is handled by `corrupt-log-policy`. A
+torn tail -- the ordinary result of a crash during a write -- is truncated;
+so is a checksum failure, unless the policy is `refuse`, in which case the
+server declines to start and says why. The two are reported differently,
+because truncating at a checksum failure throws away every write that
+followed it.
+
+If the log stops accepting writes, so does the server: writes are refused
+with `MISCONF` and reads keep working. Acknowledging a write that will not
+survive a restart is worse than an outage, because it looks like success.
+
+**Still missing from M3:** nothing triggers a snapshot yet. The snapshotter
+works and is tested, but `snapshot-interval` is not acted on and there is no
+`BGSAVE` or `BGREWRITEAOF`, so the log grows without bound and recovery
+replays all of it. That is the next piece of work.
 
 ## Quick start
 

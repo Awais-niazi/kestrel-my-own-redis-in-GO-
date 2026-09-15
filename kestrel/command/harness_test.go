@@ -23,6 +23,8 @@ type testHost struct {
 	start time.Time
 	now   atomic.Int64
 
+	persistErr error
+
 	mu      sync.Mutex
 	effects []effect
 	// sink, when set, receives effects instead of recording them. The
@@ -88,7 +90,11 @@ func (h *testHost) Stats() *Stats              { return h.stats }
 func (h *testHost) Shutdown(bool) error        { return nil }
 func (h *testHost) IsReplica() bool            { return false }
 func (h *testHost) IsLoading() bool            { return false }
-func (h *testHost) StartTime() time.Time       { return h.start }
+
+// persistErr, when set, makes the host refuse writes the way a failed append
+// log does.
+func (h *testHost) PersistenceError() error { return h.persistErr }
+func (h *testHost) StartTime() time.Time    { return h.start }
 
 func (h *testHost) ApplyRuntimeConfig() {
 	snap := h.cfg.Snapshot()

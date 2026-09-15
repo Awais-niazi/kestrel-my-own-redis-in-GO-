@@ -118,6 +118,15 @@ func Recover(opts RecoverOptions, a Applier) (Result, error) {
 	}
 	defer f.Close()
 
+	// A log that begins after the point recovery must start from is missing
+	// records, and there is no way to tell which. Continuing would rebuild a
+	// dataset with a hole in the middle of it and report success.
+	if r.Base() > opts.From {
+		return res, fmt.Errorf("persist: %s begins at offset %d but recovery must "+
+			"start at %d: the records between them are not in any file",
+			opts.Path, r.Base(), opts.From)
+	}
+
 	res.Offset = r.Base()
 	for r.Next() {
 		rec := r.Record()

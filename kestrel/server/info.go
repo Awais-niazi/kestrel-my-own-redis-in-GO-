@@ -170,11 +170,34 @@ func (s *Server) infoPersistence(b *strings.Builder) {
 	kv(b, "appendonly", boolInt(snap.AppendOnly))
 	kv(b, "appendfsync", snap.AppendFsync)
 	kv(b, "changes_since_last_save", s.ks.Stats().Changes)
-	// The append log and snapshotter land in M3; the fields exist now so
-	// that dashboards built against them do not need reworking later.
-	kv(b, "aol_enabled", boolInt(snap.AppendOnly))
-	kv(b, "aol_last_write_status", "ok")
-	kv(b, "rdb_last_save_time", 0)
+
+	p := s.persist
+	kv(b, "aol_enabled", boolInt(p != nil))
+	status, lastErr := "ok", ""
+	if p != nil {
+		if err := p.Err(); err != nil {
+			status, lastErr = "err", err.Error()
+		}
+	}
+	kv(b, "aol_last_write_status", status)
+	if lastErr != "" {
+		// The reason is reported as well as the status. A dashboard that can
+		// only see "err" sends someone to read the process log, which is the
+		// slowest possible way to learn that the disk is full.
+		kv(b, "aol_last_write_error", lastErr)
+	}
+	st := p.stats()
+	kv(b, "aol_current_size", st.Size)
+	kv(b, "aol_stream_offset", st.Offset)
+	kv(b, "aol_writes", st.Writes)
+	kv(b, "aol_fsyncs", st.Syncs)
+	kv(b, "aol_last_fsync_usec", st.LastSyncTime.Microseconds())
+	if p != nil {
+		kv(b, "aol_dir", p.dir)
+		kv(b, "rdb_last_save_time", p.lastSave.Load())
+	} else {
+		kv(b, "rdb_last_save_time", 0)
+	}
 	kv(b, "snapshot_in_progress", 0)
 }
 

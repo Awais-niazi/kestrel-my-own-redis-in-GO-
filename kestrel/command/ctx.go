@@ -31,6 +31,9 @@ type Host interface {
 	IsReplica() bool
 	// IsLoading reports whether the dataset is still being read from disk.
 	IsLoading() bool
+	// PersistenceError reports why durable writes are failing, or nil. A
+	// non-nil value makes the dispatcher refuse writes.
+	PersistenceError() error
 	// StartTime is when the process began serving.
 	StartTime() time.Time
 	// ApplyRuntimeConfig re-reads the configuration into the subsystems

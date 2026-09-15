@@ -141,3 +141,20 @@ write on top of a value that already contains it.
 The directive instead caps how many collection elements go into one rebuild
 command, which bounds the size of a single record. The reasoning, and what
 the resulting pause actually costs, are in `docs/design-notes.md` issue 9.
+
+## Connections wait rather than receiving `-LOADING` during startup recovery
+
+The reference implementation binds its port, accepts connections, and replies
+`-LOADING` to most commands while it reads its dataset from disk.
+
+Kestrel binds its listeners before recovery but does not accept from them
+until recovery has finished, so a client that connects during a replay waits
+in the kernel's backlog instead. The port is reserved either way, so nothing
+is refused, and the admin server's `/ready` endpoint reports the truth
+throughout. A client with a connect timeout shorter than the replay will time
+out where Redis would have given it an error to retry on.
+
+The `LOADING` machinery exists in the command table and is used by the
+`loading` flag, so switching to the reference behaviour is a change of
+ordering in `Serve` rather than new code. It is written down here because the
+difference is visible to a client, not because it is hard to change.
