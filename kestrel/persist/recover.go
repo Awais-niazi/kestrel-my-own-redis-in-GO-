@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"time"
@@ -61,8 +62,8 @@ func ParseCorruptPolicy(s string) (CorruptPolicy, error) {
 
 // RecoverOptions configures a recovery pass.
 type RecoverOptions struct {
-	// Path is the log to replay.
-	Path string
+	// Dir is the directory holding the log segments.
+	Dir string
 	// Policy decides what to do with a log that cannot be read to its end.
 	Policy CorruptPolicy
 	// Logger receives progress and any warning about discarded records. It
@@ -87,8 +88,11 @@ type Result struct {
 	// Damage is the reason the log could not be read to its end, wrapping
 	// ErrTornTail or ErrCorrupt. It is nil for a clean log.
 	Damage error
-	// Discarded is how many bytes were cut from the end of the file.
+	// Discarded is how many bytes were cut from the end of the last
+	// segment.
 	Discarded int64
+	// Segments is how many segment files were read.
+	Segments int
 	// Elapsed is how long the pass took.
 	Elapsed time.Duration
 }
@@ -112,27 +116,77 @@ func Recover(opts RecoverOptions, a Applier) (Result, error) {
 	start := time.Now()
 	var res Result
 
-	r, f, err := OpenReader(opts.Path)
+	if _, err := adoptLegacyLog(opts.Dir); err != nil {
+		return res, err
+	}
+	segs, err := Segments(opts.Dir)
 	if err != nil {
 		return res, err
 	}
-	defer f.Close()
+	res.Segments = len(segs)
+	if len(segs) == 0 {
+		return res, fmt.Errorf("persist: no log segments in %s: %w",
+			opts.Dir, fs.ErrNotExist)
+	}
 
 	// A log that begins after the point recovery must start from is missing
 	// records, and there is no way to tell which. Continuing would rebuild a
 	// dataset with a hole in the middle of it and report success.
-	if r.Base() > opts.From {
-		return res, fmt.Errorf("persist: %s begins at offset %d but recovery must "+
-			"start at %d: the records between them are not in any file",
-			opts.Path, r.Base(), opts.From)
+	if segs[0].Base > opts.From {
+		return res, fmt.Errorf("persist: the log begins at offset %d but recovery "+
+			"must start at %d: the records between them are in no file",
+			segs[0].Base, opts.From)
+	}
+	res.Offset = segs[0].Base
+
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		if seg.End <= opts.From && !last {
+			// Every record in this segment is already in the snapshot, so
+			// it is not even opened. That is the point of segmenting: a
+			// compacted-away range costs nothing to skip.
+			res.Offset = seg.End
+			continue
+		}
+		damaged, err := replaySegment(opts, seg, last, a, &res)
+		if err != nil {
+			return res, err
+		}
+		if damaged {
+			break
+		}
 	}
 
-	res.Offset = r.Base()
+	res.Elapsed = time.Since(start)
+	if res.Damage == nil {
+		logf(opts.Logger, slog.LevelInfo, "recovered from append log",
+			"dir", opts.Dir, "segments", res.Segments, "records", res.Records,
+			"skipped", res.Skipped, "offset", res.Offset, "elapsed", res.Elapsed)
+	}
+	return res, nil
+}
+
+// replaySegment applies one segment and deals with any damage at its end.
+//
+// Damage in a segment that is not the last is always fatal, whatever the
+// policy. Truncating there would orphan every segment after it, so
+// "truncate" would silently discard far more than the operator asked for --
+// and a torn tail cannot occur anywhere but the last segment, because a new
+// one is only started from a clean state.
+func replaySegment(opts RecoverOptions, seg Segment, last bool, a Applier,
+	res *Result) (damaged bool, err error) {
+
+	r, f, err := OpenReader(seg.Path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
 	for r.Next() {
 		rec := r.Record()
 		if rec.Kind != KindEffect {
-			return res, fmt.Errorf("%w: record at offset %d is not an effect",
-				ErrCorrupt, rec.Offset)
+			return false, fmt.Errorf("%w: record at offset %d in %s is not an effect",
+				ErrCorrupt, rec.Offset, seg.Path)
 		}
 		if rec.Offset < opts.From {
 			res.Skipped++
@@ -140,30 +194,29 @@ func Recover(opts RecoverOptions, a Applier) (Result, error) {
 			continue
 		}
 		if err := a.Apply(rec.DB, rec.Offset, rec.Args); err != nil {
-			return res, fmt.Errorf("%w at offset %d: %w", ErrDiverged, rec.Offset, err)
+			return false, fmt.Errorf("%w at offset %d: %w", ErrDiverged, rec.Offset, err)
 		}
 		res.Records++
 		res.Offset = r.Offset()
 	}
-	res.Damage = r.Err()
-	res.Elapsed = time.Since(start)
-
-	if res.Damage == nil {
-		logf(opts.Logger, slog.LevelInfo, "recovered from append log",
-			"path", opts.Path, "records", res.Records, "offset", res.Offset,
-			"elapsed", res.Elapsed)
-		return res, nil
+	if r.Err() == nil {
+		return false, nil
 	}
+	res.Damage = r.Err()
 
-	torn := errors.Is(res.Damage, ErrTornTail)
+	if !last {
+		return true, fmt.Errorf("persist: %s is damaged but is not the last segment; "+
+			"truncating it would discard every segment after it: %w",
+			seg.Path, res.Damage)
+	}
 	if opts.Policy == PolicyRefuse {
-		return res, fmt.Errorf("persist: %s is damaged after %d records and "+
-			"corrupt-log-policy is refuse: %w", opts.Path, res.Records, res.Damage)
+		return true, fmt.Errorf("persist: %s is damaged after %d records and "+
+			"corrupt-log-policy is refuse: %w", seg.Path, res.Records, res.Damage)
 	}
 
 	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
-		return res, err
+		return true, err
 	}
 	res.Discarded = size - r.FileSize()
 
@@ -171,24 +224,19 @@ func Recover(opts RecoverOptions, a Applier) (Result, error) {
 	// costs at most the command that was in flight. A checksum failure is
 	// storage damage, and everything after it is being thrown away too --
 	// that is a different sentence for an operator to read, so it gets one.
-	if torn {
+	if errors.Is(res.Damage, ErrTornTail) {
 		logf(opts.Logger, slog.LevelWarn, "append log ends mid-record; "+
 			"discarding the incomplete tail",
-			"path", opts.Path, "records", res.Records, "offset", res.Offset,
+			"path", seg.Path, "records", res.Records, "offset", res.Offset,
 			"discarded_bytes", res.Discarded, "reason", res.Damage)
 	} else {
 		logf(opts.Logger, slog.LevelError, "append log is corrupt; discarding it "+
 			"from the damaged record onwards. Every write after that point is lost. "+
 			"Set corrupt-log-policy to refuse to stop instead of truncating",
-			"path", opts.Path, "records", res.Records, "offset", res.Offset,
+			"path", seg.Path, "records", res.Records, "offset", res.Offset,
 			"discarded_bytes", res.Discarded, "reason", res.Damage)
 	}
-
-	if err := truncateAndSync(opts.Path, r.FileSize()); err != nil {
-		return res, err
-	}
-	res.Elapsed = time.Since(start)
-	return res, nil
+	return true, truncateAndSync(seg.Path, r.FileSize())
 }
 
 // truncateAndSync cuts a log to size and forces the change, so that a crash

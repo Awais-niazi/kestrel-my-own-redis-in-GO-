@@ -1,7 +1,6 @@
 package command
 
 import (
-	"path/filepath"
 	"testing"
 
 	"kestrel/persist"
@@ -9,13 +8,13 @@ import (
 
 // recordWorkload runs a randomized write stream against a fresh host and
 // writes every effect it produces to a real log file. It returns the host
-// and the log's path.
+// and the directory its log lives in.
 func recordWorkload(t *testing.T, seed int64, iterations int) (*testHost, string) {
 	t.Helper()
 	leader := newTestHost(t)
-	path := filepath.Join(t.TempDir(), "kestrel.log")
+	dir := t.TempDir()
 
-	log, err := persist.Create(persist.Options{Path: path, Fsync: persist.FsyncNo})
+	log, err := persist.OpenLog(dir, persist.FsyncNo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,12 +36,12 @@ func recordWorkload(t *testing.T, seed int64, iterations int) (*testHost, string
 	leader.mu.Lock()
 	leader.sink = func(db int, args [][]byte) {}
 	leader.mu.Unlock()
-	return leader, path
+	return leader, dir
 }
 
 // recoverInto replays a log file into a fresh host, with the keyspace in
 // loading mode for the duration and nothing propagating back out.
-func recoverInto(t *testing.T, path string, clock int64) (*testHost, persist.Result) {
+func recoverInto(t *testing.T, dir string, clock int64) (*testHost, persist.Result) {
 	t.Helper()
 	h := newTestHost(t)
 	h.now.Store(clock)
@@ -53,7 +52,7 @@ func recoverInto(t *testing.T, path string, clock int64) (*testHost, persist.Res
 	h.mu.Unlock()
 
 	h.ks.SetLoading(true)
-	res, err := persist.Recover(persist.RecoverOptions{Path: path}, NewReplayer(h))
+	res, err := persist.Recover(persist.RecoverOptions{Dir: dir}, NewReplayer(h))
 	h.ks.SetLoading(false)
 
 	// The guard above only covers the replay. Once loading ends the host is
@@ -79,9 +78,9 @@ func recoverInto(t *testing.T, path string, clock int64) (*testHost, persist.Res
 // checksum, the RESP encoding, the decoder -- is in the path being tested,
 // and a bug in any of it is a dataset that does not survive a restart.
 func TestRecoveryConverges(t *testing.T) {
-	leader, path := recordWorkload(t, 20240914, 12000)
+	leader, dir := recordWorkload(t, 20240914, 12000)
 
-	recovered, res := recoverInto(t, path, leader.now.Load())
+	recovered, res := recoverInto(t, dir, leader.now.Load())
 	if res.Records == 0 {
 		t.Fatal("the log was empty; the test proves nothing")
 	}
@@ -103,11 +102,11 @@ func TestRecoveryConverges(t *testing.T) {
 // comparison is against the leader advanced to the same later instant, which
 // is what the recovered server must look like.
 func TestRecoveryUnderALaterClock(t *testing.T) {
-	leader, path := recordWorkload(t, 20240915, 8000)
+	leader, dir := recordWorkload(t, 20240915, 8000)
 
 	// An hour of TTLs in the workload have all elapsed by now.
 	later := leader.now.Load() + 3_600_000
-	recovered, res := recoverInto(t, path, later)
+	recovered, res := recoverInto(t, dir, later)
 	if res.Records == 0 {
 		t.Fatal("the log was empty; the test proves nothing")
 	}
@@ -129,15 +128,15 @@ func TestRecoveryUnderALaterClock(t *testing.T) {
 // is replayed, more writes are appended to the same file, and the whole
 // thing is replayed again into a third keyspace.
 func TestRecoveryIsIdempotentAcrossRestarts(t *testing.T) {
-	leader, path := recordWorkload(t, 20240916, 4000)
+	leader, dir := recordWorkload(t, 20240916, 4000)
 
-	first, res := recoverInto(t, path, leader.now.Load())
+	first, res := recoverInto(t, dir, leader.now.Load())
 	if res.Records == 0 {
 		t.Fatal("nothing was replayed")
 	}
 
 	// Reopen the same log and keep writing, as a restarted server would.
-	log, err := persist.Open(persist.Options{Path: path, Fsync: persist.FsyncNo})
+	log, err := persist.OpenLog(dir, persist.FsyncNo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +160,7 @@ func TestRecoveryIsIdempotentAcrossRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, res2 := recoverInto(t, path, first.now.Load())
+	second, res2 := recoverInto(t, dir, first.now.Load())
 	if res2.Records <= res.Records {
 		t.Errorf("the second recovery read %d records, want more than %d",
 			res2.Records, res.Records)
@@ -261,8 +260,8 @@ func indexOf(s, sub string) int {
 // than on a string comparison.
 func TestIncrByFloatKeepsTTLThroughAReplay(t *testing.T) {
 	leader := newTestHost(t)
-	path := filepath.Join(t.TempDir(), "kestrel.log")
-	log, err := persist.Create(persist.Options{Path: path, Fsync: persist.FsyncNo})
+	dir := t.TempDir()
+	log, err := persist.OpenLog(dir, persist.FsyncNo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +287,7 @@ func TestIncrByFloatKeepsTTLThroughAReplay(t *testing.T) {
 	leader.sink = func(db int, args [][]byte) {}
 	leader.mu.Unlock()
 
-	recovered, _ := recoverInto(t, path, leader.now.Load())
+	recovered, _ := recoverInto(t, dir, leader.now.Load())
 	rs := newSession(t, recovered)
 	if got := str(rs.do("GET", "counter")); got != "1.5" {
 		t.Errorf("recovered value is %q, want \"1.5\"", got)

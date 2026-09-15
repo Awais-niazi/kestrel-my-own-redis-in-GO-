@@ -11,7 +11,7 @@ import (
 
 // restore replays a snapshot and then the log tail, filtering the tail
 // against the snapshot's anchors. This is what a restarting server does.
-func restore(t *testing.T, snapPath, logPath string, clock int64) (*testHost, persist.Result) {
+func restore(t *testing.T, snapPath, logDir string, clock int64) (*testHost, persist.Result) {
 	t.Helper()
 	h := newTestHost(t)
 	h.now.Store(clock)
@@ -31,7 +31,7 @@ func restore(t *testing.T, snapPath, logPath string, clock int64) (*testHost, pe
 		return load.Anchors[persist.ShardRef{DB: db, Shard: shard}]
 	})
 	res, err := persist.Recover(persist.RecoverOptions{
-		Path: logPath, From: load.First,
+		Dir: logDir, From: load.First,
 	}, filtered)
 	if err != nil {
 		t.Fatalf("replaying the log tail failed after %d records: %v", res.Records, err)
@@ -48,11 +48,10 @@ func restore(t *testing.T, snapPath, logPath string, clock int64) (*testHost, pe
 // produce a crash; it produces a counter that is off by one.
 func TestRestoreFromSnapshotAndLog(t *testing.T) {
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "kestrel.log")
 	snapPath := filepath.Join(dir, "kestrel.snapshot")
 
 	leader := newTestHost(t)
-	log, err := persist.Create(persist.Options{Path: logPath, Fsync: persist.FsyncNo})
+	log, err := persist.OpenLog(dir, persist.FsyncNo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +142,7 @@ func TestRestoreFromSnapshotAndLog(t *testing.T) {
 	t.Logf("snapshot window [%d,%d], %d records; log ends at %d",
 		info.First, info.Last, info.Records, log.Offset())
 
-	restored, res := restore(t, snapPath, logPath, leader.now.Load())
+	restored, res := restore(t, snapPath, dir, leader.now.Load())
 	t.Logf("replayed %d log records, skipped %d", res.Records, res.Skipped)
 
 	want := dump(t, leader)

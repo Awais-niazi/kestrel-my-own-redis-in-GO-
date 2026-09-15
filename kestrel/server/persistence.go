@@ -14,11 +14,9 @@ import (
 	"kestrel/persist"
 )
 
-// File names inside the data directory.
-const (
-	logFileName      = "kestrel.log"
-	snapshotFileName = "kestrel.snapshot"
-)
+// snapshotFileName is the snapshot inside the data directory. The append log
+// is a set of segment files that persist names and discovers for itself.
+const snapshotFileName = "kestrel.snapshot"
 
 // persistence owns the append log and drives startup recovery.
 //
@@ -28,7 +26,6 @@ const (
 // appendfsync policy.
 type persistence struct {
 	dir      string
-	logPath  string
 	snapPath string
 
 	log *persist.Log
@@ -55,7 +52,6 @@ func (s *Server) openPersistence(snap *config.Values) (*persistence, error) {
 	}
 	p := &persistence{
 		dir:      snap.Dir,
-		logPath:  filepath.Join(snap.Dir, logFileName),
 		snapPath: filepath.Join(snap.Dir, snapshotFileName),
 	}
 	p.lastSave.Store(time.Now().Unix())
@@ -107,48 +103,38 @@ func (s *Server) restore(p *persistence, snap *config.Values) error {
 	}
 
 	res, err := persist.Recover(persist.RecoverOptions{
-		Path: p.logPath, Policy: policy, Logger: s.log, From: from,
+		Dir: p.dir, Policy: policy, Logger: s.log, From: from,
 	}, replayer)
 	switch {
 	case err == nil:
 	case errors.Is(err, fs.ErrNotExist):
-		// A snapshot with no log beside it is the normal state right after a
-		// rewrite that has not been written to since.
-		s.log.Info("no append log found", "path", p.logPath)
+		// No segments at all is the normal state of a fresh data directory.
+		s.log.Info("no append log found", "dir", p.dir)
 	default:
-		return fmt.Errorf("replaying %s: %w", p.logPath, err)
+		return fmt.Errorf("replaying the append log in %s: %w", p.dir, err)
 	}
 
-	if err := p.openLog(snap, res.Offset); err != nil {
+	if err := p.openLog(snap); err != nil {
 		return err
 	}
 	s.log.Info("recovery complete",
 		"keys", s.ks.TotalKeys(), "log_records", res.Records,
-		"log_records_skipped", res.Skipped, "offset", p.log.Offset(),
-		"elapsed", time.Since(start))
+		"log_records_skipped", res.Skipped, "log_segments", res.Segments,
+		"offset", p.log.Offset(), "elapsed", time.Since(start))
 	return nil
 }
 
-// openLog opens the log for appending, creating it when recovery found none.
+// openLog opens the log for appending, creating the first segment when
+// recovery found none.
 //
-// A new log created beside an existing snapshot starts at the offset
-// recovery reached, not at zero, so that the stream stays continuous across
-// the gap and a later snapshot's anchors remain comparable with it.
-func (p *persistence) openLog(snap *config.Values, resumeAt uint64) error {
+// Recovery has already truncated any torn tail, which matters: appending past
+// one would bury the damage under valid data.
+func (p *persistence) openLog(snap *config.Values) error {
 	fsync, err := persist.ParseFsync(snap.AppendFsync)
 	if err != nil {
 		return err
 	}
-	opts := persist.Options{Path: p.logPath, Fsync: fsync, Base: resumeAt}
-
-	switch _, statErr := os.Stat(p.logPath); {
-	case statErr == nil:
-		p.log, err = persist.Open(opts)
-	case errors.Is(statErr, fs.ErrNotExist):
-		p.log, err = persist.Create(opts)
-	default:
-		return statErr
-	}
+	p.log, err = persist.OpenLog(p.dir, fsync)
 	return err
 }
 

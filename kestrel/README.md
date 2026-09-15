@@ -52,10 +52,23 @@ If the log stops accepting writes, so does the server: writes are refused
 with `MISCONF` and reads keep working. Acknowledging a write that will not
 survive a restart is worse than an outage, because it looks like success.
 
-**Still missing from M3:** nothing triggers a snapshot yet. The snapshotter
-works and is tested, but `snapshot-interval` is not acted on and there is no
-`BGSAVE` or `BGREWRITEAOF`, so the log grows without bound and recovery
-replays all of it. That is the next piece of work.
+The log is a sequence of segment files in `dir`:
+
+```
+kestrel-000001.log
+kestrel-000002.log
+```
+
+Stream offsets run across them, so compaction is the deletion of whole files
+rather than a rewrite: a snapshot names the offset below which every record
+is dead, and any segment ending below it can be unlinked. Nothing is copied
+and no buffer accumulates writes while it happens.
+
+**Still missing from M3:** nothing triggers a snapshot yet. The snapshotter,
+the roll and the prune all work and are tested, but `snapshot-interval` is
+not acted on and there is no `BGSAVE` or `BGREWRITEAOF` to call, so no
+segment is ever retired and recovery replays the whole log. That is the next
+piece of work.
 
 ## Quick start
 

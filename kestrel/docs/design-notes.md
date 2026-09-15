@@ -541,3 +541,74 @@ on the way in -- but narrow is not closed. The fix worth pricing: have reads
 and the `DEL` to the active cycle, which holds `prop`. That makes reads
 cheaper as well, and it makes `active-expire no` a memory-leak setting rather
 than a correctness one, which should be stated if it is taken.
+
+---
+
+## 11. Compaction by deleting segments rather than rewriting the log
+
+The append log has to stop growing, and there are two ways to do it.
+
+**Rewrite in place**, which is what the reference implementation does. Take a
+snapshot, write a fresh log holding only the records the snapshot did not
+already capture, and swap it in. Writes keep arriving while the copy runs, so
+they accumulate in a rewrite buffer that is flushed into the new file just
+before the swap. That buffer is unbounded in principle and is where the
+reference implementation's memory use surprises people.
+
+**Segment the log and unlink whole files**, which is what Kestrel does.
+
+A snapshot already names the offset below which every record is dead: its
+first anchor. So the log is a sequence of files
+
+```
+kestrel-000001.log
+kestrel-000002.log
+```
+
+and compaction is
+
+1. commit the snapshot, atomically, as it already was;
+2. **roll** -- start the next segment at the offset the stream has reached,
+   which is a create and a pointer swap, moving no data;
+3. unlink every segment whose range ends at or below the snapshot's first
+   anchor.
+
+Nothing is copied, no buffer accumulates writes, and a ten gigabyte log costs
+an `unlink` rather than ten gigabytes of I/O. It works because stream offsets
+already run across files -- the `Base` field that chunk B put in the file
+header was put there for this.
+
+### Why rolling only at snapshot time
+
+There is no segment-size directive, and there should not be one. A segment is
+started only when a snapshot has just been committed, which makes the steady
+state exactly two segments: the one straddling the current snapshot's first
+anchor, and the live one. The straddler is unlinked at the next snapshot, so
+the log settles at roughly two snapshot intervals of writes with no knob to
+tune and no way to set it wrong.
+
+### Crash safety falls out of the ordering
+
+The snapshot is renamed into place before any segment is unlinked. A crash
+between the two leaves a good snapshot and some redundant segments, whose
+records recovery skips. A crash during the snapshot leaves a temporary file,
+which is discarded. There is no instant at which a record that is still
+needed has been deleted.
+
+### Damage in a segment that is not the last is always fatal
+
+`corrupt-log-policy truncate` truncates the last segment, which is the only
+one a crash can tear. Damage anywhere earlier is refused whatever the policy,
+because truncating there would orphan every segment after it -- discarding
+far more than an operator asked for, and silently.
+
+A gap between segments, which an operator creates by deleting a file by hand,
+is refused for the same reason: the missing records are in no file and there
+is no way to tell which they were.
+
+### The one-time migration
+
+A data directory written by the previous build holds a single `kestrel.log`.
+It is renamed to `kestrel-000001.log` on startup, once, and only when no
+segments exist. It costs ten lines and it saves an operator from a server
+that starts up empty and looks fine.

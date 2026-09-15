@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-func benchLog(b *testing.B, policy Fsync) *Log {
+func benchLog(b *testing.B, policy Fsync) *segment {
 	b.Helper()
-	l, err := Create(Options{Path: filepath.Join(b.TempDir(), "bench.log"), Fsync: policy})
+	l, err := createSegment(segmentOptions{Path: filepath.Join(b.TempDir(), "bench.log"), Fsync: policy})
 	if err != nil {
 		b.Fatal(err)
 	}

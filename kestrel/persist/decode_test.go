@@ -12,7 +12,7 @@ import (
 // TestFsyncEverySecForcesInBackground covers the policy the server runs by
 // default. The append itself must not force, and the background pass must.
 func TestFsyncEverySecForcesInBackground(t *testing.T) {
-	l := tempLog(t, Options{Fsync: FsyncEverySec})
+	l := tempLog(t, segmentOptions{Fsync: FsyncEverySec})
 	if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -104,14 +104,14 @@ func TestDecodeRESPArrayAcceptsWhatItWrites(t *testing.T) {
 }
 
 func TestOpenMissingFile(t *testing.T) {
-	_, err := Open(Options{Path: filepath.Join(t.TempDir(), "absent.log")})
+	_, err := openSegment(segmentOptions{Path: filepath.Join(t.TempDir(), "absent.log")})
 	if err == nil {
 		t.Fatal("opening a log that does not exist succeeded")
 	}
 }
 
 func TestCloseIsIdempotentAndSticky(t *testing.T) {
-	l := tempLog(t, Options{})
+	l := tempLog(t, segmentOptions{})
 	if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}

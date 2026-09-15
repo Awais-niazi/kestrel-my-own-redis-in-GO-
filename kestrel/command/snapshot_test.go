@@ -257,8 +257,8 @@ func TestSnapshotAndLogAreNotInterchangeable(t *testing.T) {
 		t.Error("a snapshot was opened as a log")
 	}
 
-	logPath := filepath.Join(t.TempDir(), "kestrel.log")
-	l, err := persist.Create(persist.Options{Path: logPath})
+	logDir := t.TempDir()
+	l, err := persist.OpenLog(logDir, persist.FsyncNo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +266,12 @@ func TestSnapshotAndLogAreNotInterchangeable(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.Close()
-	if _, err := persist.LoadSnapshot(logPath, NewReplayer(h)); err == nil {
-		t.Error("a log was loaded as a snapshot")
+	segs, err := persist.Segments(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persist.LoadSnapshot(segs[0].Path, NewReplayer(h)); err == nil {
+		t.Error("a log segment was loaded as a snapshot")
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -156,8 +155,9 @@ func TestNoLogMeansEmptyStart(t *testing.T) {
 		t.Errorf("a fresh directory started with %q keys", got)
 	}
 	c.do("SET", "k", "v")
-	if _, err := os.Stat(filepath.Join(dir, logFileName)); err != nil {
-		t.Errorf("no log file was created: %v", err)
+	segs, err := persist.Segments(dir)
+	if err != nil || len(segs) != 1 {
+		t.Errorf("got %d segments (%v), want 1", len(segs), err)
 	}
 }
 
@@ -188,7 +188,7 @@ func TestCorruptLogPolicyRefuse(t *testing.T) {
 	}
 	stop(t, first)
 
-	path := filepath.Join(dir, logFileName)
+	path := onlySegment(t, dir)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +227,7 @@ func TestCorruptLogPolicyTruncate(t *testing.T) {
 	}
 	stop(t, first)
 
-	path := filepath.Join(dir, logFileName)
+	path := onlySegment(t, dir)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -299,4 +299,19 @@ func TestWritesAreRefusedWhenTheLogFails(t *testing.T) {
 	if !strings.Contains(info, "aol_last_write_status:err") {
 		t.Errorf("INFO still reports a healthy log:\n%s", info)
 	}
+}
+
+// onlySegment returns the path of the log's single segment, failing if the
+// log has been rolled: a test that corrupts "the log" has to say which file
+// it means.
+func onlySegment(t *testing.T, dir string) string {
+	t.Helper()
+	segs, err := persist.Segments(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 {
+		t.Fatalf("expected one segment, found %d", len(segs))
+	}
+	return segs[0].Path
 }

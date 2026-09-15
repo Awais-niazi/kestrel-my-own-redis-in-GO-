@@ -54,7 +54,7 @@ func ParseFsync(s string) (Fsync, error) {
 }
 
 // Options configures a log.
-type Options struct {
+type segmentOptions struct {
 	// Path is the log file.
 	Path string
 	// Fsync is the initial durability policy. It can be changed later with
@@ -72,7 +72,7 @@ type Options struct {
 // write in the server serializes. That is inherent to a single ordered log:
 // the order recorded here is the order a replica and a recovery will replay,
 // so it has to be decided somewhere.
-type Log struct {
+type segment struct {
 	path string
 
 	mu     sync.Mutex
@@ -95,7 +95,7 @@ type Log struct {
 
 // Create starts a new log file. It fails if the path already exists, so that
 // a rewrite cannot silently destroy the log it is replacing.
-func Create(opts Options) (*Log, error) {
+func createSegment(opts segmentOptions) (*segment, error) {
 	f, err := os.OpenFile(opts.Path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, err
@@ -121,7 +121,7 @@ func Create(opts Options) (*Log, error) {
 		f.Close()
 		return nil, err
 	}
-	return start(f, opts, opts.Base), nil
+	return startSegment(f, opts, opts.Base), nil
 }
 
 // Open reopens an existing log for appending.
@@ -130,7 +130,7 @@ func Create(opts Options) (*Log, error) {
 // the stream offset is derived from the file size rather than by scanning,
 // so appending to a file that still ends mid-record would bury the damage
 // under valid data.
-func Open(opts Options) (*Log, error) {
+func openSegment(opts segmentOptions) (*segment, error) {
 	f, err := os.OpenFile(opts.Path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -150,11 +150,11 @@ func Open(opts Options) (*Log, error) {
 		f.Close()
 		return nil, err
 	}
-	return start(f, opts, h.Base+uint64(size)-fileHeaderSize), nil
+	return startSegment(f, opts, h.Base+uint64(size)-fileHeaderSize), nil
 }
 
-func start(f *os.File, opts Options, offset uint64) *Log {
-	l := &Log{
+func startSegment(f *os.File, opts segmentOptions, offset uint64) *segment {
+	l := &segment{
 		path:   opts.Path,
 		f:      f,
 		offset: offset,
@@ -173,7 +173,7 @@ func start(f *os.File, opts Options, offset uint64) *Log {
 // policy is; the policy governs only whether it is also forced to stable
 // storage. That is what makes everysec survive a process kill and lose data
 // only to a machine failure.
-func (l *Log) Append(db int, args [][]byte) (uint64, error) {
+func (l *segment) Append(db int, args [][]byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.err != nil {
@@ -204,20 +204,20 @@ func (l *Log) Append(db int, args [][]byte) (uint64, error) {
 // Offset is the stream offset just past the last record written. A snapshot
 // anchors each shard to the value this returns at the instant the shard is
 // serialized.
-func (l *Log) Offset() uint64 {
+func (l *segment) Offset() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.offset
 }
 
 // Sync forces the log to stable storage regardless of policy.
-func (l *Log) Sync() error {
+func (l *segment) Sync() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.syncLocked()
 }
 
-func (l *Log) syncLocked() error {
+func (l *segment) syncLocked() error {
 	if l.err != nil {
 		return l.err
 	}
@@ -240,7 +240,7 @@ func (l *Log) syncLocked() error {
 // costs one wakeup a second under always and no, and in exchange
 // appendfsync becomes a plain atomic store rather than a goroutine that has
 // to be started and stopped underneath concurrent appends.
-func (l *Log) syncLoop() {
+func (l *segment) syncLoop() {
 	defer l.wg.Done()
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -261,22 +261,22 @@ func (l *Log) syncLoop() {
 
 // SetFsync changes the durability policy. CONFIG SET appendfsync reaches
 // this.
-func (l *Log) SetFsync(f Fsync) { l.fsync.Store(int32(f)) }
+func (l *segment) SetFsync(f Fsync) { l.fsync.Store(int32(f)) }
 
 // Fsync reports the current durability policy.
-func (l *Log) Fsync() Fsync { return Fsync(l.fsync.Load()) }
+func (l *segment) Fsync() Fsync { return Fsync(l.fsync.Load()) }
 
 // Err reports the first write or fsync failure. Once set, every subsequent
 // append fails with it: a log with a hole in it is worse than no log, so the
 // server must refuse writes rather than carry on and produce a file that
 // recovery will silently truncate.
-func (l *Log) Err() error {
+func (l *segment) Err() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.err
 }
 
-func (l *Log) fail(err error) error {
+func (l *segment) fail(err error) error {
 	if l.err == nil {
 		l.err = fmt.Errorf("persist: log %s: %w", l.path, err)
 	}
@@ -286,7 +286,7 @@ func (l *Log) fail(err error) error {
 // TruncateTo cuts the log back to a stream offset, discarding a torn tail.
 // It is the one operation that shortens a log, and recovery is its only
 // caller.
-func (l *Log) TruncateTo(off uint64) error {
+func (l *segment) TruncateTo(off uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if off > l.offset {
@@ -313,7 +313,7 @@ func (l *Log) TruncateTo(off uint64) error {
 	return l.syncLocked()
 }
 
-func (l *Log) baseLocked() (uint64, error) {
+func (l *segment) baseLocked() (uint64, error) {
 	var hb [fileHeaderSize]byte
 	if _, err := l.f.ReadAt(hb[:], 0); err != nil {
 		return 0, err
@@ -323,7 +323,7 @@ func (l *Log) baseLocked() (uint64, error) {
 }
 
 // Path is the file this log writes to.
-func (l *Log) Path() string { return l.path }
+func (l *segment) Path() string { return l.path }
 
 // Stats reports the counters INFO persistence needs.
 type Stats struct {
@@ -333,10 +333,12 @@ type Stats struct {
 	Size         int64
 	LastSyncTime time.Duration
 	Policy       Fsync
+	// Segments is how many files the log spans.
+	Segments int
 }
 
 // Stats samples the log's counters.
-func (l *Log) Stats() Stats {
+func (l *segment) Stats() Stats {
 	l.mu.Lock()
 	offset := l.offset
 	l.mu.Unlock()
@@ -357,7 +359,7 @@ func (l *Log) Stats() Stats {
 // the file. A close that cannot force the log reports the failure rather
 // than discarding it, because that is exactly the case where an operator
 // believes a clean shutdown was durable.
-func (l *Log) Close() error {
+func (l *segment) Close() error {
 	l.stopOnce.Do(func() { close(l.stop) })
 	l.wg.Wait()
 

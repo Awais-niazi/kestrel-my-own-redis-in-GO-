@@ -10,12 +10,12 @@ import (
 	"testing"
 )
 
-func tempLog(t *testing.T, opts Options) *Log {
+func tempLog(t *testing.T, opts segmentOptions) *segment {
 	t.Helper()
 	if opts.Path == "" {
 		opts.Path = filepath.Join(t.TempDir(), "kestrel.log")
 	}
-	l, err := Create(opts)
+	l, err := createSegment(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func readAll(t *testing.T, path string) ([]string, *Reader) {
 }
 
 func TestLogRoundTrip(t *testing.T) {
-	l := tempLog(t, Options{})
+	l := tempLog(t, segmentOptions{})
 	want := []string{"0:SET a 1", "3:DEL a", "0:RPUSH k x y z"}
 	for _, w := range []struct {
 		db   int
@@ -86,7 +86,7 @@ func TestLogRoundTrip(t *testing.T) {
 // anchors a shard to an offset, and recovery compares each record's offset
 // against it. An off-by-one here replays a record twice or not at all.
 func TestAppendReturnsRecordStartOffset(t *testing.T) {
-	l := tempLog(t, Options{})
+	l := tempLog(t, segmentOptions{})
 	var offsets []uint64
 	for i := 0; i < 5; i++ {
 		off, err := l.Append(0, cmd("SET", fmt.Sprint(i), "v"))
@@ -116,7 +116,7 @@ func TestAppendReturnsRecordStartOffset(t *testing.T) {
 // rewrite still names the same point in the stream afterwards.
 func TestBaseOffsetSurvivesRewrite(t *testing.T) {
 	dir := t.TempDir()
-	first := tempLog(t, Options{Path: filepath.Join(dir, "a.log")})
+	first := tempLog(t, segmentOptions{Path: filepath.Join(dir, "a.log")})
 	if _, err := first.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestBaseOffsetSurvivesRewrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := Create(Options{Path: filepath.Join(dir, "b.log"), Base: end})
+	second, err := createSegment(segmentOptions{Path: filepath.Join(dir, "b.log"), Base: end})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestBaseOffsetSurvivesRewrite(t *testing.T) {
 
 func TestReopenContinuesAtEnd(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kestrel.log")
-	l := tempLog(t, Options{Path: path})
+	l := tempLog(t, segmentOptions{Path: path})
 	if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestReopenContinuesAtEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(Options{Path: path})
+	again, err := openSegment(segmentOptions{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestTornTailIsNotCorruption(t *testing.T) {
 	for _, cut := range []int{1, 6, 12, 15} {
 		t.Run(fmt.Sprint("cut", cut), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "kestrel.log")
-			l := tempLog(t, Options{Path: path})
+			l := tempLog(t, segmentOptions{Path: path})
 			if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 				t.Fatal(err)
 			}
@@ -225,7 +225,7 @@ func TestTornTailIsNotCorruption(t *testing.T) {
 // is the only thing standing between it and a silently wrong recovery.
 func TestCorruptPayloadIsDetected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kestrel.log")
-	l := tempLog(t, Options{Path: path})
+	l := tempLog(t, segmentOptions{Path: path})
 	for i := 0; i < 3; i++ {
 		if _, err := l.Append(0, cmd("SET", fmt.Sprint(i), "value")); err != nil {
 			t.Fatal(err)
@@ -275,7 +275,7 @@ func TestBadFileHeaderIsRejected(t *testing.T) {
 
 	t.Run("damaged header", func(t *testing.T) {
 		path := filepath.Join(dir, "damaged")
-		l := tempLog(t, Options{Path: path})
+		l := tempLog(t, segmentOptions{Path: path})
 		l.Close()
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -293,17 +293,17 @@ func TestBadFileHeaderIsRejected(t *testing.T) {
 
 func TestCreateRefusesToOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kestrel.log")
-	l := tempLog(t, Options{Path: path})
+	l := tempLog(t, segmentOptions{Path: path})
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Create(Options{Path: path}); !errors.Is(err, os.ErrExist) {
+	if _, err := createSegment(segmentOptions{Path: path}); !errors.Is(err, os.ErrExist) {
 		t.Errorf("Create over an existing log returned %v, want ErrExist", err)
 	}
 }
 
 func TestTruncateTo(t *testing.T) {
-	l := tempLog(t, Options{})
+	l := tempLog(t, segmentOptions{})
 	first, err := l.Append(0, cmd("SET", "a", "1"))
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +339,7 @@ func TestTruncateTo(t *testing.T) {
 }
 
 func TestTruncateRejectsOutOfRange(t *testing.T) {
-	l := tempLog(t, Options{})
+	l := tempLog(t, segmentOptions{})
 	if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +349,7 @@ func TestTruncateRejectsOutOfRange(t *testing.T) {
 }
 
 func TestFsyncAlwaysForcesEveryAppend(t *testing.T) {
-	l := tempLog(t, Options{Fsync: FsyncAlways})
+	l := tempLog(t, segmentOptions{Fsync: FsyncAlways})
 	for i := 0; i < 3; i++ {
 		if _, err := l.Append(0, cmd("SET", fmt.Sprint(i), "v")); err != nil {
 			t.Fatal(err)
@@ -361,7 +361,7 @@ func TestFsyncAlwaysForcesEveryAppend(t *testing.T) {
 }
 
 func TestFsyncNoNeverForces(t *testing.T) {
-	l := tempLog(t, Options{Fsync: FsyncNo})
+	l := tempLog(t, segmentOptions{Fsync: FsyncNo})
 	for i := 0; i < 3; i++ {
 		if _, err := l.Append(0, cmd("SET", fmt.Sprint(i), "v")); err != nil {
 			t.Fatal(err)
@@ -379,7 +379,7 @@ func TestFsyncNoNeverForces(t *testing.T) {
 }
 
 func TestSetFsyncIsLive(t *testing.T) {
-	l := tempLog(t, Options{Fsync: FsyncNo})
+	l := tempLog(t, segmentOptions{Fsync: FsyncNo})
 	if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestSetFsyncIsLive(t *testing.T) {
 }
 
 func TestConcurrentAppendsAreOrderedAndComplete(t *testing.T) {
-	l := tempLog(t, Options{Fsync: FsyncNo})
+	l := tempLog(t, segmentOptions{Fsync: FsyncNo})
 	const writers, each = 8, 200
 
 	var wg sync.WaitGroup
@@ -439,7 +439,7 @@ func TestConcurrentAppendsAreOrderedAndComplete(t *testing.T) {
 }
 
 func TestAppendAfterFailureKeepsFailing(t *testing.T) {
-	l := tempLog(t, Options{Fsync: FsyncNo})
+	l := tempLog(t, segmentOptions{Fsync: FsyncNo})
 	if _, err := l.Append(0, cmd("SET", "a", "1")); err != nil {
 		t.Fatal(err)
 	}
