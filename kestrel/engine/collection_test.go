@@ -444,7 +444,7 @@ func TestCollectionReadsSurviveLaterWrites(t *testing.T) {
 	h.Set([]byte("f"), []byte("first"), &th)
 	held, _ := h.Get([]byte("f"))
 	for i := 0; i < 50; i++ {
-		h.Set([]byte(fmt.Sprintf("pad%d", i)), []byte(strings.Repeat("x", 20)), &th)
+		h.Set(fmt.Appendf(nil, "pad%d", i), []byte(strings.Repeat("x", 20)), &th)
 	}
 	h.Set([]byte("f"), []byte("second"), &th)
 	if string(held) != "first" {
@@ -455,7 +455,7 @@ func TestCollectionReadsSurviveLaterWrites(t *testing.T) {
 	l.Push([]byte("head"), false, &th)
 	front := l.Range(0, 0)
 	for i := 0; i < 50; i++ {
-		l.Push([]byte(fmt.Sprintf("e%d", i)), false, &th)
+		l.Push(fmt.Appendf(nil, "e%d", i), false, &th)
 	}
 	if string(front[0]) != "head" {
 		t.Errorf("a list element handed out earlier now reads %q", front[0])
@@ -465,7 +465,7 @@ func TestCollectionReadsSurviveLaterWrites(t *testing.T) {
 	s.Add([]byte("alpha"), &th)
 	members := s.Members()
 	for i := 0; i < 50; i++ {
-		s.Add([]byte(fmt.Sprintf("m%d", i)), &th)
+		s.Add(fmt.Appendf(nil, "m%d", i), &th)
 	}
 	if string(members[0]) != "alpha" {
 		t.Errorf("a set member handed out earlier now reads %q", members[0])
@@ -550,7 +550,7 @@ func TestQuicklistCloneIsIndependent(t *testing.T) {
 
 	l := newList()
 	for i := 0; i < 30; i++ {
-		l.Push([]byte(fmt.Sprintf("e%02d", i)), false, &th)
+		l.Push(fmt.Appendf(nil, "e%02d", i), false, &th)
 	}
 	if l.Encoding() != EncodingQuicklist {
 		t.Fatal("list did not promote")

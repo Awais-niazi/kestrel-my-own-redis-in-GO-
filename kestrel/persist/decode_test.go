@@ -42,7 +42,7 @@ func TestRecordSizeMatchesEncoding(t *testing.T) {
 	}
 	many := make([][]byte, 0, 128)
 	for i := 0; i < 128; i++ {
-		many = append(many, []byte(fmt.Sprint(i)))
+		many = append(many, fmt.Append(nil, i))
 	}
 	cases = append(cases, many)
 

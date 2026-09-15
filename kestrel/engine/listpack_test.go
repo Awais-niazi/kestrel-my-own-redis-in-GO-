@@ -124,7 +124,7 @@ func TestListpackDeleteRunAndTruncate(t *testing.T) {
 	build := func() *listpack {
 		l := newListpack(0)
 		for i := 0; i < 10; i++ {
-			l.Append([]byte(fmt.Sprintf("e%d", i)))
+			l.Append(fmt.Appendf(nil, "e%d", i))
 		}
 		return l
 	}
@@ -292,7 +292,7 @@ func BenchmarkListpackAppend(b *testing.B) {
 func BenchmarkListpackLookup(b *testing.B) {
 	l := newListpack(0)
 	for j := 0; j < 128; j++ {
-		l.Append([]byte(fmt.Sprintf("member-%d", j)))
+		l.Append(fmt.Appendf(nil, "member-%d", j))
 	}
 	needle := []byte("member-127")
 	b.ReportAllocs()

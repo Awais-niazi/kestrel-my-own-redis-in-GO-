@@ -665,7 +665,7 @@ func (db *DB) LMove(src, dst []byte, srcFront, dstFront bool) ([]byte, error) {
 	if do == nil {
 		target := newList()
 		target.Push(v, dstFront, t)
-		do = db.newCollection(ds, dst, TypeList, target)
+		db.newCollection(ds, dst, TypeList, target)
 		db.touched(dst)
 	} else {
 		target := do.Value.(*List)

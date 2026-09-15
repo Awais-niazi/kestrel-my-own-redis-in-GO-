@@ -195,7 +195,7 @@ func TestActiveExpirePass(t *testing.T) {
 	db := ks.DB(0)
 
 	for i := 0; i < 500; i++ {
-		k := []byte(fmt.Sprintf("k%d", i))
+		k := fmt.Appendf(nil, "k%d", i)
 		db.Set(k, []byte("v"), SetOptions{At: *now + 100})
 	}
 	for i := 0; i < 50; i++ {
@@ -629,7 +629,7 @@ func TestConcurrentAccess(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < 500; i++ {
-				k := []byte(fmt.Sprintf("k%d", i%50))
+				k := fmt.Appendf(nil, "k%d", i%50)
 				switch i % 8 {
 				case 0:
 					db.Set(k, []byte("v"), SetOptions{})

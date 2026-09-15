@@ -89,7 +89,7 @@ func TestSkiplistTiesBreakOnMember(t *testing.T) {
 func TestSkiplistScoreRanges(t *testing.T) {
 	sl := newSkiplist()
 	for i := 1; i <= 5; i++ {
-		sl.Insert(float64(i), []byte(fmt.Sprintf("m%d", i)))
+		sl.Insert(float64(i), fmt.Appendf(nil, "m%d", i))
 	}
 	cases := []struct {
 		r           ScoreRange
@@ -212,7 +212,7 @@ func TestSkiplistLargeRanks(t *testing.T) {
 	sl := newSkiplist()
 	const n = 5000
 	for i := 0; i < n; i++ {
-		sl.Insert(float64(i), []byte(fmt.Sprintf("m%05d", i)))
+		sl.Insert(float64(i), fmt.Appendf(nil, "m%05d", i))
 	}
 	if sl.length != n {
 		t.Fatalf("length %d", sl.length)
@@ -240,7 +240,7 @@ func BenchmarkSkiplistInsert(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		sl := newSkiplist()
 		for j := 0; j < 1000; j++ {
-			sl.Insert(float64(j), []byte(fmt.Sprintf("m%d", j)))
+			sl.Insert(float64(j), fmt.Appendf(nil, "m%d", j))
 		}
 	}
 }
@@ -248,7 +248,7 @@ func BenchmarkSkiplistInsert(b *testing.B) {
 func BenchmarkSkiplistRank(b *testing.B) {
 	sl := newSkiplist()
 	for j := 0; j < 100000; j++ {
-		sl.Insert(float64(j), []byte(fmt.Sprintf("m%06d", j)))
+		sl.Insert(float64(j), fmt.Appendf(nil, "m%06d", j))
 	}
 	member := []byte("m050000")
 	b.ReportAllocs()
