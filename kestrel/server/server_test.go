@@ -79,16 +79,14 @@ func startServer(t *testing.T, tweaks ...func(*config.Config)) *testServer {
 	ts := &testServer{Server: srv, port: port, adminPort: adminPort, done: make(chan error, 1)}
 	go func() { ts.done <- srv.Serve(context.Background()) }()
 
-	// Wait for the listener to come up.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.Dial("tcp", ts.addr())
-		if err == nil {
-			c.Close()
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Wait until the server is actually serving, not merely bound.
+	//
+	// The listener is created before startup recovery runs, so a bare dial
+	// succeeds into the kernel backlog while the server is still loading. A
+	// PING that comes back is the only thing that proves the accept loop is
+	// running, and everything set up before it -- the keyspace, the log --
+	// is ordered before that by the goroutine that answers.
+	waitReady(t, ts.addr())
 	t.Cleanup(func() {
 		srv.Shutdown(false)
 		if err := ts.wait(t); err != nil {
@@ -540,4 +538,30 @@ func TestInfoSections(t *testing.T) {
 	if !strings.Contains(string(c.do("INFO", "all").Str), "# Latencystats") {
 		t.Error("INFO all is missing latencystats")
 	}
+}
+
+func waitReady(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if pingOK(addr) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("server at %s did not answer PING within 15s", addr)
+}
+
+func pingOK(addr string) bool {
+	nc, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		return false
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := nc.Write(resp.EncodeCommand(nil, []byte("PING"))); err != nil {
+		return false
+	}
+	v, err := resp.NewReplyReader(nc).ReadReply()
+	return err == nil && strings.EqualFold(string(v.Str), "PONG")
 }

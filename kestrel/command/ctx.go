@@ -34,6 +34,11 @@ type Host interface {
 	// PersistenceError reports why durable writes are failing, or nil. A
 	// non-nil value makes the dispatcher refuse writes.
 	PersistenceError() error
+	// Snapshot writes a point-in-time copy of the dataset and compacts the
+	// log. background decides whether the caller waits for the result.
+	Snapshot(background bool) error
+	// LastSave is when the last snapshot completed, in unix seconds.
+	LastSave() int64
 	// StartTime is when the process began serving.
 	StartTime() time.Time
 	// ApplyRuntimeConfig re-reads the configuration into the subsystems

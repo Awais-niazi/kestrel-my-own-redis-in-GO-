@@ -263,7 +263,16 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		var el EffectLog = p
 		s.SetEffectLog(el)
-		s.log.Info("persistence is on", "dir", p.dir, "appendfsync", snap.AppendFsync)
+		// The scheduling baselines start from the state recovery left, so
+		// the first snapshot is due an interval from now rather than
+		// immediately.
+		p.changesAtSave.Store(s.ks.Stats().Changes)
+		p.sizeAtSave.Store(p.log.Stats().Size)
+		s.workers.Add(1)
+		go s.maintenance(p)
+		s.log.Info("persistence is on", "dir", p.dir,
+			"appendfsync", snap.AppendFsync,
+			"snapshot_interval_seconds", snap.SnapshotInterval)
 	}
 
 	for _, l := range s.listeners {

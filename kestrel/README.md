@@ -9,17 +9,17 @@ distribution and is not affiliated with Redis Ltd.
 
 ## Status
 
-**M0 (skeleton), M1 (core key/value) and M2 (collections) are complete, and
-M3 (persistence) now survives a restart.** The server runs, real Redis
-clients talk to it, and strings, lists, hashes, sets, sorted sets, generic
-keyspace commands, expiration and durability all work.
+**M0 (skeleton), M1 (core key/value), M2 (collections) and M3 (persistence)
+are complete.** The server runs, real Redis clients talk to it, and strings,
+lists, hashes, sets, sorted sets, generic keyspace commands, expiration and
+durability all work.
 
 | Milestone | Scope | State |
 |---|---|---|
 | M0 | RESP2 codec, TCP/TLS server, connection handling, config, fuzz harness | done |
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
-| M3 | Append log, snapshots, recovery, compaction | in progress: log and recovery live; snapshots not yet scheduled |
+| M3 | Append log, snapshots, recovery, compaction | done |
 | M4 | Replication | not started |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
@@ -64,11 +64,22 @@ rather than a rewrite: a snapshot names the offset below which every record
 is dead, and any segment ending below it can be unlinked. Nothing is copied
 and no buffer accumulates writes while it happens.
 
-**Still missing from M3:** nothing triggers a snapshot yet. The snapshotter,
-the roll and the prune all work and are tested, but `snapshot-interval` is
-not acted on and there is no `BGSAVE` or `BGREWRITEAOF` to call, so no
-segment is ever retired and recovery replays the whole log. That is the next
-piece of work.
+Snapshots run on `snapshot-interval`, when the log has grown past
+`auto-rewrite-percentage` of its size at the last one, and on `SAVE`,
+`BGSAVE` or `BGREWRITEAOF`. Each one writes the dataset, rolls the log, and
+unlinks the segments it made redundant. An idle server does not snapshot
+again: a pass that would change nothing still costs a shard-blocking pause.
+
+Measured on a 5,000-write workload over 40 keys: 251,676 bytes of log before
+`BGREWRITEAOF`, 13,038 bytes after, and the restart that followed rebuilt all
+41 keys from the snapshot plus the one record written since.
+
+The pause is worth knowing about. Serializing a shard holds its lock for the
+whole shard, and at the default 16 shards a 200,000-key database blocks one
+shard for about 6.5 ms. Raising `shards` divides that almost linearly -- 256
+shards brings the same database to 279 µs -- and
+[`docs/design-notes.md`](docs/design-notes.md) issue 9 has the numbers and
+the alternatives.
 
 ## Quick start
 
@@ -135,6 +146,9 @@ RESP3) `QUIT` `RESET` `CLIENT ID|GETNAME|SETNAME|INFO|NO-EVICT|HELP`
 **Server** `INFO` `CONFIG GET|SET|RESETSTAT` `COMMAND` (`COUNT` `INFO` `DOCS`
 `GETKEYS`) `SLOWLOG` `MEMORY USAGE|DOCTOR` `OBJECT` `DEBUG` `TIME` `SHUTDOWN`
 `CLUSTER INFO|MYID|SLOTS|SHARDS`
+
+**Persistence** `SAVE` `BGSAVE` `BGREWRITEAOF` `LASTSAVE` — all three saves
+are one operation here, which `docs/deviations.md` explains
 
 **Operations** protected mode, `requirepass`, TLS and mutual TLS,
 `rename-command`, structured JSON logs, graceful shutdown, a separate admin

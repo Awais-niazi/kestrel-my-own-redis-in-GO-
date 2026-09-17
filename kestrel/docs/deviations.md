@@ -158,3 +158,24 @@ The `LOADING` machinery exists in the command table and is used by the
 `loading` flag, so switching to the reference behaviour is a change of
 ordering in `Serve` rather than new code. It is written down here because the
 difference is visible to a client, not because it is hard to change.
+
+## `SAVE`, `BGSAVE` and `BGREWRITEAOF` are three names for one operation
+
+In the reference implementation these are genuinely different. `SAVE` and
+`BGSAVE` write an RDB file; `BGREWRITEAOF` rewrites the append-only file; the
+two formats coexist and an operator chooses between them.
+
+Kestrel has one durability story -- a snapshot, plus the log segments written
+after it -- so a snapshot *is* the compaction. All three commands take a
+snapshot, roll the log and unlink the segments the snapshot made redundant.
+`SAVE` blocks until it is done; the other two return immediately.
+
+They are kept as three commands rather than collapsed into one because
+tooling calls whichever it was written against, and an operator running
+`BGREWRITEAOF` to reclaim disk gets exactly that. `BGSAVE SCHEDULE` is
+accepted and reports honestly: there is nothing to defer, because the
+maintenance loop takes the next snapshot anyway.
+
+`LASTSAVE` reports the time of the last successful snapshot, and is seeded at
+startup rather than left at zero, so that a server which has not yet
+snapshotted does not look like one whose save failed in 1970.

@@ -23,7 +23,12 @@ type testHost struct {
 	start time.Time
 	now   atomic.Int64
 
-	persistErr error
+	persistErr  error
+	snapshotErr error
+
+	snapshots           atomic.Int64
+	backgroundSnapshots atomic.Int64
+	lastSave            atomic.Int64
 
 	mu      sync.Mutex
 	effects []effect
@@ -94,7 +99,23 @@ func (h *testHost) IsLoading() bool            { return false }
 // persistErr, when set, makes the host refuse writes the way a failed append
 // log does.
 func (h *testHost) PersistenceError() error { return h.persistErr }
-func (h *testHost) StartTime() time.Time    { return h.start }
+
+// Snapshot records the request rather than writing anything: the command
+// tests are about what the commands do, and the snapshotter has its own.
+func (h *testHost) Snapshot(background bool) error {
+	if h.snapshotErr != nil {
+		return h.snapshotErr
+	}
+	h.snapshots.Add(1)
+	if background {
+		h.backgroundSnapshots.Add(1)
+	}
+	h.lastSave.Store(h.now.Load() / 1000)
+	return nil
+}
+
+func (h *testHost) LastSave() int64      { return h.lastSave.Load() }
+func (h *testHost) StartTime() time.Time { return h.start }
 
 func (h *testHost) ApplyRuntimeConfig() {
 	snap := h.cfg.Snapshot()

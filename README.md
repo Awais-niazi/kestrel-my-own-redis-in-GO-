@@ -38,16 +38,16 @@ where the repository came from.
 
 ## Status
 
-M0 (skeleton), M1 (core key/value) and M2 (collections) are complete: 145
-working commands, strings, lists, hashes, sets and sorted sets with adaptive
+M0 (skeleton), M1 (core key/value), M2 (collections) and M3 (persistence)
+are complete: 149 working commands, strings, lists, hashes, sets and sorted sets with adaptive
 encodings, expiration, `SCAN`, RESP2 and RESP3, TLS, and a metrics endpoint.
 
-M3 (persistence) is in progress and **a restart now keeps your data.** With
+M3 (persistence) is complete: **a restart keeps your data.** With
 `appendonly yes` the server logs the canonical effect of every write and
-rebuilds the keyspace from it on startup, TTLs included. What is still
-missing is scheduling: the snapshotter works and is tested, but nothing
-triggers it yet, so the log grows without bound and recovery replays all of
-it.
+rebuilds the keyspace from it on startup, TTLs included. Snapshots run on a
+timer, on log growth, or on `SAVE`/`BGSAVE`/`BGREWRITEAOF`, and compaction
+unlinks whole log segments rather than rewriting the log — a 251 KB log came
+down to 13 KB in the round trip that verified it.
 
 The per-milestone table is in [`kestrel/README.md`](kestrel/README.md#status).
 

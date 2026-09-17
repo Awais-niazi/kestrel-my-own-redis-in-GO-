@@ -402,18 +402,30 @@ with 501 allocations total -- about 2.8M keys/second, and the allocations are
 per shard and per collection copy rather than per key. The walker itself is
 cheap.
 
-The pause is not. At that rate a 10M-key dataset takes ~3.6 s to serialize,
-and with 16 shards that is **~220 ms during which one sixteenth of the
-keyspace is blocked**. Commands hashing to other shards run normally, so this
-is not a full stop, but it is far past the p99.9 budget in §8.1 for the
-shard it lands on.
+The pause is not, and it is now measured rather than estimated.
+`TestSnapshotShardPauseByShardCount` serializes a 200,000-key database and
+reports the worst single shard hold:
+
+| Shards | Worst shard hold | Whole pass |
+|---|---|---|
+| 16 | 6.47 ms | 55 ms |
+| 64 | 875 µs | 35 ms |
+| 256 | 279 µs | 35 ms |
+
+Commands hashing to other shards run normally throughout, so this is not a
+full stop -- but at 16 shards it is already past the p99.9 budget in §8.1 for
+the shard it lands on, and a 10M-key dataset is fifty times larger.
 
 Three ways out, in increasing order of cost to build:
 
-1. **Raise the shard count.** The pause divides by it. 256 shards puts the
-   same dataset at ~14 ms per shard. This is nearly free and should be the
-   first answer; ADR-003's shard count was chosen for lock contention, not
-   for snapshot latency, and the two want the same thing.
+1. **Raise the shard count.** The pause divides by it, and very nearly
+   linearly: sixteen times the shards gave twenty-three times the
+   improvement above, because the smaller maps are also friendlier to the
+   cache. The whole pass gets faster too. This is nearly free and should be
+   the first answer; ADR-003's shard count was chosen for lock contention,
+   not for snapshot latency, and it turns out the two want the same thing.
+   The test asserts the shape of this relationship, so it will be noticed if
+   it stops holding.
 2. **Copy the shard under the lock and serialize outside it.** Turns a long
    CPU hold into a short one plus a memory spike of one shard's worth of
    deep copies. Cheaper in latency, worse in peak memory, and it needs a
@@ -424,9 +436,10 @@ Three ways out, in increasing order of cost to build:
    load. It is also awkward in Go, where a fork without exec is not
    supported for a multi-threaded runtime.
 
-Option 1 is the recommendation and needs a measurement, not a rewrite.
-Nothing here is urgent while `snapshot-interval` defaults to 900 s, but the
-number should be known before anyone turns it down.
+Option 1 is the recommendation, and it now has the measurement. Nothing here
+is urgent while `snapshot-interval` defaults to 900 s, but an operator
+turning that down, or running a dataset much larger than the benchmark's,
+should raise `shards` at the same time.
 
 ### Why a snapshot reuses the log's framing
 

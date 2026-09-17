@@ -36,6 +36,15 @@ type persistence struct {
 	failed atomic.Pointer[error]
 
 	lastSave atomic.Int64 // unix seconds
+
+	// running guards against two snapshots at once. A second pass would
+	// overwrite the first's temporary file and produce anchors from two
+	// different walks.
+	running atomic.Bool
+	// changesAtSave and sizeAtSave are the baselines the scheduling
+	// triggers compare against.
+	changesAtSave atomic.Int64
+	sizeAtSave    atomic.Int64
 }
 
 // openPersistence prepares the data directory and returns the subsystem, or
@@ -205,4 +214,181 @@ func (s *Server) PersistenceError() error {
 		return nil
 	}
 	return s.persist.Err()
+}
+
+// Snapshot writes a point-in-time copy of the dataset and compacts the log.
+//
+// The order is the one crash safety depends on: the snapshot is renamed into
+// place, then the log rolls, then the segments the snapshot made redundant
+// are unlinked. A crash between the rename and the unlink leaves segments
+// recovery will skip; a crash before the rename leaves the previous
+// snapshot. At no point has a record that is still needed been deleted.
+func (p *persistence) Snapshot(s *Server) (SnapshotOutcome, error) {
+	var out SnapshotOutcome
+	if !p.running.CompareAndSwap(false, true) {
+		return out, errSnapshotRunning
+	}
+	defer p.running.Store(false)
+
+	started := time.Now()
+	w, err := persist.CreateSnapshot(p.snapPath)
+	if err != nil {
+		return out, err
+	}
+
+	cfg := s.cfg.Snapshot()
+	opts := command.SnapshotOptions{
+		Offset:        p.log.Offset,
+		BatchElements: cfg.SnapshotBatchKeys,
+	}
+	// The guard is held for the whole pass, so no cross-shard
+	// read-modify-write effect can land inside the window the anchors span.
+	var walkErr error
+	s.ks.SnapshotWindow(func() { walkErr = command.WriteSnapshot(s.ks, w, opts) })
+	if walkErr != nil {
+		w.Abort()
+		return out, walkErr
+	}
+
+	info, err := w.Commit()
+	if err != nil {
+		w.Abort()
+		return out, err
+	}
+	out.Records, out.First, out.Last = info.Records, info.First, info.Last
+	out.SnapshotBytes = info.Size
+
+	if err := p.log.Roll(); err != nil {
+		// The snapshot is good and is in place; only the compaction failed.
+		// Reporting it without discarding the snapshot is the useful
+		// outcome, because the next attempt will compact both.
+		return out, fmt.Errorf("rolling the log after a snapshot: %w", err)
+	}
+	removed, freed, err := p.log.Prune(info.First)
+	out.SegmentsRemoved, out.BytesFreed = removed, freed
+
+	p.lastSave.Store(time.Now().Unix())
+	p.changesAtSave.Store(s.ks.Stats().Changes)
+	p.sizeAtSave.Store(p.log.Stats().Size)
+	out.Elapsed = time.Since(started)
+	return out, err
+}
+
+// SnapshotOutcome describes a completed snapshot.
+type SnapshotOutcome struct {
+	Records         int64
+	First, Last     uint64
+	SnapshotBytes   int64
+	SegmentsRemoved int
+	BytesFreed      int64
+	Elapsed         time.Duration
+}
+
+var (
+	// ErrNoPersistence is returned when a save is asked for on a server that
+	// is not persisting anything.
+	ErrNoPersistence   = errors.New("persistence is disabled")
+	errSnapshotRunning = errors.New("a snapshot is already in progress")
+)
+
+// Snapshot satisfies the command layer's Host. background decides whether
+// the caller waits for the result.
+func (s *Server) Snapshot(background bool) error {
+	p := s.persist
+	if p == nil {
+		return ErrNoPersistence
+	}
+	if background {
+		if p.running.Load() {
+			return errSnapshotRunning
+		}
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			s.snapshotAndLog(p, "background")
+		}()
+		return nil
+	}
+	return s.snapshotAndLog(p, "foreground")
+}
+
+func (s *Server) snapshotAndLog(p *persistence, why string) error {
+	out, err := p.Snapshot(s)
+	if err != nil {
+		s.log.Error("snapshot failed", "trigger", why, "error", err)
+		return err
+	}
+	s.log.Info("snapshot complete", "trigger", why, "records", out.Records,
+		"window_first", out.First, "window_last", out.Last,
+		"snapshot_bytes", out.SnapshotBytes, "segments_removed", out.SegmentsRemoved,
+		"bytes_freed", out.BytesFreed, "elapsed", out.Elapsed)
+	return nil
+}
+
+// LastSave is when the last snapshot completed, in unix seconds.
+func (s *Server) LastSave() int64 {
+	if s.persist == nil {
+		return 0
+	}
+	return s.persist.lastSave.Load()
+}
+
+// maintenance takes snapshots on a schedule.
+//
+// It checks once a second rather than sleeping for the whole interval, so
+// that a CONFIG SET of snapshot-interval takes effect without a restart and
+// the growth trigger is noticed promptly under a write burst.
+func (s *Server) maintenance(p *persistence) {
+	defer s.workers.Done()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-s.quit:
+			return
+		case <-tick.C:
+			if why := s.snapshotDue(p); why != "" {
+				s.snapshotAndLog(p, why)
+			}
+		}
+	}
+}
+
+// snapshotDue reports why a snapshot should run now, or "".
+func (s *Server) snapshotDue(p *persistence) string {
+	if p.running.Load() || s.IsLoading() || p.Err() != nil {
+		return ""
+	}
+	cfg := s.cfg.Snapshot()
+
+	// An idle server does not need a new snapshot of the same data, however
+	// long it has been idle: a snapshot that changes nothing still costs a
+	// full serialization pass and a shard-blocking pause.
+	changed := s.ks.Stats().Changes - p.changesAtSave.Load()
+	if changed <= 0 {
+		return ""
+	}
+
+	if cfg.SnapshotInterval > 0 {
+		age := time.Now().Unix() - p.lastSave.Load()
+		if age >= int64(cfg.SnapshotInterval) {
+			return "interval"
+		}
+	}
+
+	// Growth is measured against the log's size just after the last
+	// snapshot, which is what the percentage is a percentage of.
+	if cfg.AutoRewritePercentage > 0 {
+		size := p.log.Stats().Size
+		if size >= cfg.AutoRewriteMinSize {
+			base := p.sizeAtSave.Load()
+			if base <= 0 {
+				return "growth"
+			}
+			if size >= base+base*int64(cfg.AutoRewritePercentage)/100 {
+				return "growth"
+			}
+		}
+	}
+	return ""
 }

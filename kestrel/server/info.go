@@ -194,11 +194,14 @@ func (s *Server) infoPersistence(b *strings.Builder) {
 	kv(b, "aol_last_fsync_usec", st.LastSyncTime.Microseconds())
 	if p != nil {
 		kv(b, "aol_dir", p.dir)
+		kv(b, "aol_segments", st.Segments)
 		kv(b, "rdb_last_save_time", p.lastSave.Load())
+		kv(b, "snapshot_in_progress", boolInt(p.running.Load()))
+		kv(b, "snapshot_interval", snap.SnapshotInterval)
 	} else {
 		kv(b, "rdb_last_save_time", 0)
+		kv(b, "snapshot_in_progress", 0)
 	}
-	kv(b, "snapshot_in_progress", 0)
 }
 
 func (s *Server) infoStats(b *strings.Builder) {
