@@ -173,6 +173,12 @@ type Log struct {
 	mu   sync.Mutex
 	cur  *segment
 	segs []Segment // every segment, including the one being written
+	// appended is closed and replaced every time a record is written, so a
+	// follower can wait for the next one without polling. A closed channel
+	// is the cheapest broadcast Go has, and unlike a sync.Cond it composes
+	// with a select on a context.
+	appended chan struct{}
+	closed   bool
 
 	fsync atomic.Int32
 }
@@ -192,7 +198,7 @@ func OpenLog(dir string, fsync Fsync) (*Log, error) {
 		return nil, err
 	}
 
-	l := &Log{dir: dir, segs: segs}
+	l := &Log{dir: dir, segs: segs, appended: make(chan struct{})}
 	l.fsync.Store(int32(fsync))
 
 	if len(segs) == 0 {
@@ -224,7 +230,38 @@ func (l *Log) startSegmentLocked(seq int, base uint64) error {
 func (l *Log) Append(db int, args [][]byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.cur.Append(db, args)
+	at, err := l.cur.Append(db, args)
+	if err == nil {
+		l.wakeLocked()
+	}
+	return at, err
+}
+
+// wakeLocked releases every follower waiting for a new record.
+func (l *Log) wakeLocked() {
+	close(l.appended)
+	l.appended = make(chan struct{})
+}
+
+// Appended returns a channel that is closed when the next record is written,
+// or immediately if the log has been closed.
+//
+// The channel must be taken before the caller checks the offset it is
+// waiting past. Taking it afterwards would miss a record written in between
+// and the follower would sleep with data available.
+func (l *Log) Appended() <-chan struct{} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.appended
+}
+
+// OldestOffset is the earliest offset the log can still serve. Anything
+// before it was in a segment that compaction unlinked, so a replica asking
+// for it needs a full resynchronisation rather than a partial one.
+func (l *Log) OldestOffset() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segs[0].Base
 }
 
 // Offset is the stream offset just past the last record written.
@@ -245,6 +282,7 @@ func (l *Log) Roll() error {
 
 	at := l.cur.Offset()
 	seq := l.segs[len(l.segs)-1].Seq + 1
+	defer l.wakeLocked()
 	if err := l.cur.Sync(); err != nil {
 		return err
 	}
@@ -339,7 +377,20 @@ func (l *Log) Err() error {
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if !l.closed {
+		l.closed = true
+		// Followers are woken so they observe the close rather than
+		// blocking until a record that will never come.
+		l.wakeLocked()
+	}
 	return l.cur.Close()
+}
+
+// Closed reports whether the log has been closed.
+func (l *Log) Closed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
 }
 
 // Dir is the directory the log lives in.

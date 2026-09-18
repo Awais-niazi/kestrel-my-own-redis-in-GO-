@@ -69,6 +69,45 @@ func OpenSnapshotReader(path string) (*Reader, *os.File, error) {
 	return openReader(path, snapshotMagic)
 }
 
+// OpenReaderAt opens a log segment positioned at a stream offset.
+//
+// A record's position in the file is fileHeaderSize + (offset - base), so
+// reaching an offset is a seek rather than a scan. That matters for a
+// follower tailing a live segment: without it, every catch-up after an
+// end-of-file would re-read the segment from its start, which is quadratic
+// in the number of records.
+func OpenReaderAt(path string, at uint64) (*Reader, *os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	var hb [fileHeaderSize]byte
+	if _, err := f.ReadAt(hb[:], 0); err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("persist: reading header of %s: %w", path, err)
+	}
+	h, err := decodeFileHeader(hb[:], logMagic)
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("persist: %s: %w", path, err)
+	}
+	if at < h.Base {
+		f.Close()
+		return nil, nil, fmt.Errorf("%w: offset %d is before %s, which begins at %d",
+			ErrTooFarBehind, at, path, h.Base)
+	}
+	if _, err := f.Seek(int64(at-h.Base)+fileHeaderSize, io.SeekStart); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return &Reader{
+		src:  bufio.NewReaderSize(f, 64<<10),
+		base: h.Base,
+		off:  at,
+		buf:  make([]byte, 0, 4096),
+	}, f, nil
+}
+
 func openReader(path, magic string) (*Reader, *os.File, error) {
 	f, err := os.Open(path)
 	if err != nil {

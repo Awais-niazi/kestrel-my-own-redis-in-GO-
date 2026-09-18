@@ -625,3 +625,58 @@ A data directory written by the previous build holds a single `kestrel.log`.
 It is renamed to `kestrel-000001.log` on startup, once, and only when no
 segments exist. It costs ten lines and it saves an operator from a server
 that starts up empty and looks fine.
+
+---
+
+## 12. The log is the replication backlog
+
+A replica needs "every effect from offset X onwards, then whatever comes
+next". That is exactly what the append log already holds: records in order,
+addressed by a stream offset that spans files and survives compaction.
+
+So Kestrel has no separate replication backlog. There is no ring buffer to
+size, nothing to keep in memory in parallel with the log, and no second copy
+of the same records to keep consistent with the first.
+
+**`repl-backlog-size` therefore becomes a statement about log retention**
+rather than about a buffer, and retention is already decided by how often
+snapshots run. That is a deviation and it is written down, but it is a
+simplification rather than a compromise: the reference implementation's
+backlog can overflow while the AOF still holds the records, which is a
+partial resynchronisation refused for no reason that exists on disk.
+
+### A partial resynchronisation is a seek
+
+A record's position in its file is `fileHeaderSize + (offset - base)`, so
+reaching an offset is an `lseek`, not a scan. `TestFollowSeeksRatherThanScans`
+pins this: without it, every catch-up after an end-of-file would re-read the
+segment from the start, and a live tail would be quadratic in the number of
+records.
+
+The case where a partial resynchronisation is impossible is precisely the
+case where compaction has unlinked the segment holding those records, and the
+log can answer that exactly -- `OldestOffset` -- rather than by guessing at
+what a buffer still contains.
+
+### A follower cannot see a half-written record
+
+`Follower` never reads past the offset the log reports, and that offset only
+advances once a whole record has been handed to the operating system. So a
+torn read is impossible by construction rather than something the reader has
+to detect and recover from, and damage seen while following is real damage.
+
+This matters because the same bytes mean different things in the two paths:
+recovery finding a partial record at the end of a file is an ordinary crash
+artefact, while a follower finding one would be a bug.
+
+### Waking without polling
+
+`Log.Appended` returns a channel closed by the next append. A closed channel
+is the cheapest broadcast Go has, and unlike a `sync.Cond` it composes with a
+`select` on a context, so a follower can be released by a write, a
+cancellation, or the log closing, without a timer anywhere.
+
+The channel is taken *before* the offset it is waiting past is re-checked. The
+other order has a race that loses a record: the follower reads the offset,
+a write lands, and only then does it subscribe -- and it then sleeps with data
+available.

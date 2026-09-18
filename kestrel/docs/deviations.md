@@ -179,3 +179,22 @@ maintenance loop takes the next snapshot anyway.
 `LASTSAVE` reports the time of the last successful snapshot, and is seeded at
 startup rather than left at zero, so that a server which has not yet
 snapshotted does not look like one whose save failed in 1970.
+
+## `repl-backlog-size` describes log retention, not a buffer
+
+The reference implementation keeps a fixed-size in-memory ring of recent
+commands for partial resynchronisation, sized by `repl-backlog-size`, and
+separate from the append-only file.
+
+Kestrel serves a replica straight from the log segments, which already hold
+every effect in order and addressed by stream offset. There is no second
+buffer to size, so `repl-backlog-size` is accepted and reported but does not
+allocate anything: how far back a replica can resynchronise is decided by how
+much log is retained, which follows from `snapshot-interval` and the
+auto-rewrite directives.
+
+The practical difference is in Kestrel's favour. A reference backlog can
+overflow and force a full resynchronisation while the records the replica
+wants are still on disk in the AOF. Here, a partial resynchronisation is
+refused only when the segment holding those records has actually been
+unlinked.
