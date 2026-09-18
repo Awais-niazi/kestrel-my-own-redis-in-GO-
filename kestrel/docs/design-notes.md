@@ -792,3 +792,54 @@ drops and reconnects needs a full transfer. The reference implementation has
 the same dynamic when its backlog is small relative to the write rate. It is
 worth knowing before turning `snapshot-interval` down on a leader with
 replicas.
+
+---
+
+## 15. What WAIT actually promises, and what makes it prompt
+
+`WAIT numreplicas timeout` is easy to read as something stronger than it is,
+so the promise is worth stating exactly: **at the moment it returns, this
+many replicas had acknowledged an offset at least as high as the one this
+leader had reached when WAIT began.**
+
+It is not a transaction. It does not make the writes before it atomic, it
+does not roll anything back if the count comes up short, and a replica that
+acknowledged can still be lost a moment later. What it gives is a bound on
+how much is only on one machine.
+
+Two details that follow from being precise about it:
+
+**The target is sampled once.** A write arriving during the wait does not
+move the goal. Otherwise a leader taking writes continuously could never
+satisfy a `WAIT`, because the thing being waited for would recede at the rate
+it was being produced -- and the caller is asking about the writes *they* had
+already made.
+
+**A zero timeout means "do not wait", not "wait forever".** That is what the
+reference implementation means by it, and it is the opposite of what the word
+suggests, so it is pinned by a test rather than left to be discovered.
+
+### Acknowledgements are sent on catch-up, not only on a timer
+
+A replica acknowledges whenever it drains its buffer, and on a one-second
+timer as a fallback for an idle link. The timer alone would put up to a
+second of latency under every `WAIT` for no reason at all.
+
+Catching up is the right signal because it is exactly what `WAIT` is waiting
+for. Under a burst the buffer is rarely empty, so it costs one acknowledgement
+per burst rather than one per record; under a trickle it costs one per record,
+which is thirty bytes upstream for a write that has already travelled further
+than that.
+
+The reference implementation solves this by sending `REPLCONF GETACK` down
+the replication stream. That is not available here: the stream carries framed
+records whose sizes advance the replica's offset, so injecting a control
+record would either desynchronise the offset or need a special case in the
+one piece of arithmetic that must not have one.
+
+### min-replicas-max-lag is measured from the last acknowledgement
+
+Not from the last byte written. A leader with nothing to send would otherwise
+watch every healthy replica fall out of sync the moment the write rate
+dropped to zero, and start refusing writes precisely because there were none
+-- which is both wrong and the hardest kind of outage to diagnose.

@@ -107,3 +107,11 @@ func errMisconf(err error) resp.Value {
 	return resp.Err("MISCONF Errors writing to the append log: " + err.Error() +
 		". Writes are refused until it recovers.")
 }
+
+// errNotEnoughReplicas refuses a write because min-replicas-to-write is not
+// satisfied. The counts are in the message: "NOREPLICAS" alone leaves an
+// operator to go and find out how far short they are.
+func errNotEnoughReplicas(have, need int) resp.Value {
+	return resp.Err("NOREPLICAS Not enough good replicas to write. " +
+		itoa(have) + " in sync, " + itoa(need) + " required.")
+}

@@ -289,3 +289,88 @@ func TestReplicaOfRejectsBadArguments(t *testing.T) {
 		}
 	}
 }
+
+// TestWaitWithARealReplica is the property WAIT exists for: when it returns
+// the count, those replicas really do hold the writes.
+func TestWaitWithARealReplica(t *testing.T) {
+	leader, replica, lc, rc := pair(t)
+
+	for i := 0; i < 200; i++ {
+		lc.do("SET", fmt.Sprintf("k%d", i), fmt.Sprint(i))
+	}
+	if got := text(lc.do("WAIT", "1", "10000")); got != "1" {
+		t.Fatalf("WAIT returned %q, want 1", got)
+	}
+
+	// WAIT returning 1 means the replica has them now, not eventually.
+	if got := text(rc.do("GET", "k199")); got != "199" {
+		t.Errorf("WAIT said the replica was caught up, but k199 = %q", got)
+	}
+	if got := text(rc.do("DBSIZE")); got != text(lc.do("DBSIZE")) {
+		t.Errorf("DBSIZE differs right after WAIT: replica %s, leader %s",
+			got, text(lc.do("DBSIZE")))
+	}
+	_ = replica
+	_ = leader
+}
+
+// TestWaitTimesOutRatherThanHanging covers asking for more replicas than
+// exist.
+func TestWaitTimesOutRatherThanHanging(t *testing.T) {
+	_, _, lc, _ := pair(t)
+	lc.do("SET", "k", "v")
+
+	start := time.Now()
+	got := text(lc.do("WAIT", "5", "300"))
+	elapsed := time.Since(start)
+	if got != "1" {
+		t.Errorf("WAIT for 5 replicas returned %q, want the 1 that exists", got)
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("WAIT returned after %v without waiting out its timeout", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("WAIT overran its timeout by a long way: %v", elapsed)
+	}
+}
+
+// TestWaitWithZeroTimeoutDoesNotBlock pins the meaning of a zero timeout,
+// which is "do not wait" and not "wait forever".
+func TestWaitWithZeroTimeoutDoesNotBlock(t *testing.T) {
+	_, _, lc, _ := pair(t)
+	lc.do("SET", "k", "v")
+	start := time.Now()
+	lc.do("WAIT", "5", "0")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("WAIT with a zero timeout blocked for %v", elapsed)
+	}
+}
+
+// TestMinReplicasToWriteWithARealReplica exercises the directive against a
+// link that can actually be broken.
+func TestMinReplicasToWriteWithARealReplica(t *testing.T) {
+	leader, _, lc, _ := pair(t)
+	if err := leader.cfg.Set("min-replicas-to-write", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := text(lc.do("SET", "ok", "1")); got != "OK" {
+		t.Fatalf("a write with the replica connected returned %q", got)
+	}
+
+	for _, l := range leader.replicaLinks() {
+		l.cancel()
+	}
+	waitFor(t, "the leader to notice the replica has gone", func() bool {
+		return leader.ReplicasInSync() == 0
+	})
+
+	got := text(lc.do("SET", "refused", "1"))
+	if !strings.HasPrefix(got, "NOREPLICAS") {
+		t.Errorf("a write with no replicas returned %q, want NOREPLICAS", got)
+	}
+	// Reads keep working: the directive bounds loss, it does not stop the
+	// server serving.
+	if got := text(lc.do("GET", "ok")); got != "1" {
+		t.Errorf("reads were refused too: %q", got)
+	}
+}

@@ -30,13 +30,16 @@ import (
 
 // replicaLink is one connected replica, as the leader sees it.
 type replicaLink struct {
-	id     uint64
-	addr   string
-	port   int
-	state  atomic.Value // string
-	ack    *atomic.Uint64
-	since  time.Time
-	cancel context.CancelFunc
+	id    uint64
+	addr  string
+	port  int
+	state atomic.Value // string
+	ack   *atomic.Uint64
+	// lastAck is when an acknowledgement last arrived, which is what
+	// min-replicas-max-lag is measured against.
+	lastAck atomic.Int64
+	since   time.Time
+	cancel  context.CancelFunc
 }
 
 func (r *replicaLink) status() string {
@@ -102,6 +105,7 @@ func (s *Server) serveReplica(c *connection, req *command.PSyncRequest) {
 		id: c.cl.ID, addr: c.cl.Addr, port: req.ListeningPort,
 		ack: &c.cl.ReplicaAck, since: time.Now(), cancel: cancel,
 	}
+	link.lastAck.Store(time.Now().Unix())
 	link.state.Store("sync")
 	s.registerReplica(link)
 	defer s.unregisterReplica(link.id)
@@ -234,7 +238,78 @@ func (s *Server) readReplicaAcks(ctx context.Context, c *connection, link *repli
 			strings.EqualFold(string(args[1]), "ACK") {
 			if n, err := strconv.ParseUint(string(args[2]), 10, 64); err == nil {
 				link.ack.Store(n)
+				link.lastAck.Store(time.Now().Unix())
 			}
 		}
 	}
+}
+
+// inSync reports whether a replica has acknowledged recently enough to count
+// towards min-replicas-to-write.
+//
+// "Recently enough" is measured from the last acknowledgement rather than
+// from the last byte written, because a leader with nothing to send would
+// otherwise watch every healthy replica fall out of sync the moment the
+// write rate dropped to zero.
+func (r *replicaLink) inSync(maxLag int) bool {
+	if r.status() != "online" {
+		return false
+	}
+	if maxLag <= 0 {
+		return true
+	}
+	last := r.lastAck.Load()
+	if last == 0 {
+		return false
+	}
+	return time.Now().Unix()-last <= int64(maxLag)
+}
+
+// ReplicasInSync counts the replicas healthy enough to satisfy
+// min-replicas-to-write.
+func (s *Server) ReplicasInSync() int {
+	maxLag := s.cfg.Snapshot().MinReplicasMaxLag
+	n := 0
+	for _, l := range s.replicaLinks() {
+		if l.inSync(maxLag) {
+			n++
+		}
+	}
+	return n
+}
+
+// WaitReplicas blocks until numreplicas have acknowledged everything written
+// so far, or until timeout passes, and returns how many had.
+//
+// The target is sampled once, at the start. A write arriving afterwards must
+// not move the goal: WAIT answers a question about the writes the caller had
+// already made, and a busy leader would otherwise never satisfy it.
+func (s *Server) WaitReplicas(numreplicas int, timeout time.Duration) int {
+	target := s.replicationOffset()
+	deadline := time.Now().Add(timeout)
+
+	for {
+		n := s.ackedAtLeast(target)
+		if n >= numreplicas {
+			return n
+		}
+		if timeout <= 0 || !time.Now().Before(deadline) {
+			return n
+		}
+		select {
+		case <-s.quit:
+			return s.ackedAtLeast(target)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) ackedAtLeast(target uint64) int {
+	n := 0
+	for _, l := range s.replicaLinks() {
+		if l.ack.Load() >= target {
+			n++
+		}
+	}
+	return n
 }

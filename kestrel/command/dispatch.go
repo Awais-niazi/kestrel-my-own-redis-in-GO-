@@ -160,6 +160,16 @@ func resolve(host Host, cl *Client, args [][]byte) (*Descriptor, resp.Value) {
 			table.recordRejected(d)
 			return nil, errMisconf(err)
 		}
+		// min-replicas-to-write trades availability for a bound on how much
+		// an operator can lose if this leader is lost. Refusing is the whole
+		// point of the directive, so it is refused loudly and with the
+		// numbers in the message.
+		if need := cfg.MinReplicasToWrite; need > 0 {
+			if have := host.ReplicasInSync(); have < need {
+				table.recordRejected(d)
+				return nil, errNotEnoughReplicas(have, need)
+			}
+		}
 		if d.Is(DenyOOM) && overMemoryLimit(host, cfg.MaxMemory, cfg.MaxMemoryPolicy) {
 			table.recordRejected(d)
 			return nil, errOOM

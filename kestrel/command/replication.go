@@ -3,6 +3,7 @@ package command
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"kestrel/resp"
 )
@@ -120,4 +121,42 @@ func cmdPSync(c *Ctx) resp.Value {
 	c.Client.PSync = req
 	c.Client.Replica = true
 	return resp.None()
+}
+
+func init() {
+	register(&Descriptor{
+		Name: "WAIT", Arity: 3, Flags: Readonly | NoMulti | Blocking,
+		Categories: []string{"slow", "connection"},
+		Summary: "Blocks until a number of replicas have acknowledged every " +
+			"write made by this connection so far.",
+		Handler: cmdWait,
+	})
+}
+
+// cmdWait reports how many replicas have caught up, having waited for them.
+//
+// It is not a transaction and does not make the writes before it atomic.
+// What it answers is narrower and worth being precise about: at the moment
+// it returns, this many replicas had acknowledged an offset at least as high
+// as the one this leader had reached when WAIT began. A write that arrives
+// during the wait does not move that target -- the question is about the
+// writes the caller had already made.
+func cmdWait(c *Ctx) resp.Value {
+	n, err1 := resp.ParseInt(c.Arg(1))
+	ms, err2 := resp.ParseInt(c.Arg(2))
+	if err1 != nil || err2 != nil {
+		return errNotInteger
+	}
+	if n < 0 || ms < 0 {
+		return resp.Err("ERR timeout is negative")
+	}
+	if c.Host.IsReplica() {
+		return resp.Err("ERR WAIT cannot be used with replica instances. Please " +
+			"also note that since Kestrel 0.1 read commands are accepted on " +
+			"replicas, so WAIT would have no meaning there.")
+	}
+	// A zero timeout means "do not wait", not "wait forever", which is what
+	// the reference implementation means by it and the opposite of what the
+	// word usually suggests.
+	return resp.Int(int64(c.Host.WaitReplicas(int(n), time.Duration(ms)*time.Millisecond)))
 }

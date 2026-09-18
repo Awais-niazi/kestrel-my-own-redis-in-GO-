@@ -268,6 +268,21 @@ func (s *Server) applyStream(ctx context.Context, st *replicaState, nc net.Conn,
 	}
 
 	stream := persist.NewRecordStream(br, from)
+
+	// Acknowledgements are sent whenever the replica catches up, and on a
+	// timer as a fallback for a link that is idle.
+	//
+	// Catching up is the signal that matters: WAIT on the leader is waiting
+	// for exactly this, and a timer alone would put a second of latency
+	// under every WAIT for no reason. Under a burst the buffer is rarely
+	// empty, so this is one acknowledgement per burst rather than per
+	// record.
+	var ackMu sync.Mutex
+	ack := func() {
+		ackMu.Lock()
+		defer ackMu.Unlock()
+		writeCommand(nc, "REPLCONF", "ACK", strconv.FormatUint(st.offset.Load(), 10))
+	}
 	ackTicker := time.NewTicker(time.Second)
 	defer ackTicker.Stop()
 	go func() {
@@ -276,11 +291,11 @@ func (s *Server) applyStream(ctx context.Context, st *replicaState, nc net.Conn,
 			case <-ctx.Done():
 				return
 			case <-ackTicker.C:
-				writeCommand(nc, "REPLCONF", "ACK",
-					strconv.FormatUint(st.offset.Load(), 10))
+				ack()
 			}
 		}
 	}()
+	ack()
 
 	for {
 		if ctx.Err() != nil {
@@ -303,6 +318,9 @@ func (s *Server) applyStream(ctx context.Context, st *replicaState, nc net.Conn,
 		}
 		st.offset.Store(stream.Offset())
 		st.lastIO.Store(time.Now().Unix())
+		if br.Buffered() == 0 {
+			ack()
+		}
 	}
 }
 

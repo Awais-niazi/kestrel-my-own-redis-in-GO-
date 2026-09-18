@@ -42,6 +42,12 @@ type Host interface {
 	// Follow makes this server a replica of host:port, or promotes it to a
 	// leader when host is empty.
 	Follow(host string, port int) error
+	// ReplicasInSync counts the replicas acknowledging recently enough to
+	// satisfy min-replicas-to-write.
+	ReplicasInSync() int
+	// WaitReplicas blocks until numreplicas have acknowledged every write
+	// made so far, or until timeout passes, and returns how many had.
+	WaitReplicas(numreplicas int, timeout time.Duration) int
 	// StartTime is when the process began serving.
 	StartTime() time.Time
 	// ApplyRuntimeConfig re-reads the configuration into the subsystems

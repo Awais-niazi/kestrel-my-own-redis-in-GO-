@@ -26,6 +26,11 @@ type testHost struct {
 	persistErr  error
 	snapshotErr error
 	followErr   error
+	isReplica   bool
+
+	replicasInSync atomic.Int64
+	replicasAcked  atomic.Int64
+	waitCalls      atomic.Int64
 
 	followHost string // guarded by mu
 	followPort int    // guarded by mu
@@ -97,7 +102,7 @@ func (h *testHost) Config() *config.Config     { return h.cfg }
 func (h *testHost) Commands() *Table           { return h.table }
 func (h *testHost) Stats() *Stats              { return h.stats }
 func (h *testHost) Shutdown(bool) error        { return nil }
-func (h *testHost) IsReplica() bool            { return false }
+func (h *testHost) IsReplica() bool            { return h.isReplica }
 func (h *testHost) IsLoading() bool            { return false }
 
 // persistErr, when set, makes the host refuse writes the way a failed append
@@ -119,6 +124,15 @@ func (h *testHost) Snapshot(background bool) error {
 }
 
 func (h *testHost) LastSave() int64 { return h.lastSave.Load() }
+
+// ReplicasInSync and WaitReplicas are driven by fields the tests set, so the
+// command behaviour can be exercised without a second server.
+func (h *testHost) ReplicasInSync() int { return int(h.replicasInSync.Load()) }
+
+func (h *testHost) WaitReplicas(numreplicas int, timeout time.Duration) int {
+	h.waitCalls.Add(1)
+	return int(h.replicasAcked.Load())
+}
 
 // Follow records what REPLICAOF asked for. The replication machinery has its
 // own tests against a real socket; these are about the command.
