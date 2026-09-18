@@ -229,6 +229,27 @@ func (s *Server) infoReplication(b *strings.Builder) {
 	}
 	kv(b, "role", role)
 
+	if st := s.replicaLink(); st != nil {
+		kv(b, "master_host", st.host)
+		kv(b, "master_port", st.port)
+		kv(b, "master_link_status", st.status())
+		kv(b, "master_sync_in_progress", boolInt(st.syncing.Load()))
+		kv(b, "slave_repl_offset", st.offset.Load())
+		kv(b, "slave_read_only", boolInt(s.cfg.Snapshot().ReplicaReadOnly))
+		kv(b, "sync_full", st.fullSync.Load())
+		if io := st.lastIO.Load(); io > 0 {
+			kv(b, "master_last_io_seconds_ago", time.Now().Unix()-io)
+		} else {
+			kv(b, "master_last_io_seconds_ago", -1)
+		}
+		// The reason the link is down is reported rather than left in the
+		// process log. "down" without a why sends an operator looking in
+		// the wrong place.
+		if e, ok := st.lastErr.Load().(string); ok && !st.linkUp.Load() {
+			kv(b, "master_link_down_reason", e)
+		}
+	}
+
 	links := s.replicaLinks()
 	kv(b, "connected_slaves", len(links))
 	for i, l := range links {

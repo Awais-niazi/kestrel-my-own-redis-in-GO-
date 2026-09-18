@@ -737,3 +737,58 @@ asked for on the client and returns nothing; the connection loop sees the
 request, flushes, and hands the socket to the replication code without
 returning to the loop. The command layer decides that a handover is wanted;
 the server decides whether it can be granted.
+
+---
+
+## 14. The replica applies the leader's stream with the code a restart uses
+
+A replica's full synchronisation is: receive the snapshot, write it to a
+file, load it, then apply the record stream with the snapshot's anchors as a
+filter. Every one of those steps is the restart path from chunk E, called
+with a socket in place of a directory.
+
+Writing the received snapshot to a file before loading it, rather than
+parsing it from memory, is deliberate. A second loader would be a second
+place for the shipped format and the stored format to disagree, and the
+disagreement would show up as a replica that is quietly wrong rather than as
+a parse error.
+
+The anchor filter stays installed for the life of the link. It does not need
+removing: once the stream passes the last anchor, every shard qualifies for
+every record and the filter stops excluding anything on its own.
+
+### What a replica does not do yet, and why that is a decision
+
+A replica applies to its keyspace and does not write its own log, so a
+replica restart is a full resynchronisation.
+
+Persisting a replica's log needs an invariant the leader does not have. A
+shipped snapshot is usable only once the stream has reached the end of the
+window its anchors span: before that, different shards hold different
+instants, and the offset the replica would record does not describe any of
+them. A replica that crashed mid-transfer and restarted from
+`snapshot + partial log` would come up with shards at inconsistent points and
+an offset claiming they were all together.
+
+The rule that makes it safe is checkable -- local state is usable only when
+`log.Offset() >= snapshot.Last` -- and it is worth building deliberately
+rather than discovering after a crash. Until then, a replica restart costs a
+full transfer, which is correct and merely slower.
+
+### Reconnecting is where a partial resynchronisation earns its keep
+
+Within one process lifetime a replica knows the leader's replication id and
+its own offset, so a dropped link resumes with a seek and no transfer.
+`TestReplicaResumesAfterLinkLoss` asserts that the reconnect did *not* cost a
+full synchronisation, because a test that only checks the data would pass
+just as happily if every reconnect shipped the whole dataset.
+
+### A note on the first replica
+
+A leader with no snapshot takes one when its first replica connects, which
+also rolls and prunes the log. That is visible in `INFO`: `repl_oldest_offset`
+jumps close to `master_repl_offset`, so for a short window a replica that
+drops and reconnects needs a full transfer. The reference implementation has
+the same dynamic when its backlog is small relative to the write rate. It is
+worth knowing before turning `snapshot-interval` down on a leader with
+replicas.

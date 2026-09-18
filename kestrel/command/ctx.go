@@ -39,6 +39,9 @@ type Host interface {
 	Snapshot(background bool) error
 	// LastSave is when the last snapshot completed, in unix seconds.
 	LastSave() int64
+	// Follow makes this server a replica of host:port, or promotes it to a
+	// leader when host is empty.
+	Follow(host string, port int) error
 	// StartTime is when the process began serving.
 	StartTime() time.Time
 	// ApplyRuntimeConfig re-reads the configuration into the subsystems

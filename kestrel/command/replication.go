@@ -40,6 +40,39 @@ func init() {
 		Summary:    "Starts a replication stream, taking over the connection.",
 		Handler:    cmdPSync,
 	})
+	register(&Descriptor{
+		Name: "REPLICAOF", Arity: 3, Flags: Readonly | Admin | NoMulti | Stale,
+		Categories: []string{"admin", "slow", "dangerous"},
+		Summary:    "Makes this server a replica of another, or promotes it with NO ONE.",
+		Handler:    cmdReplicaOf,
+	})
+	register(&Descriptor{
+		Name: "SLAVEOF", Arity: 3, Flags: Readonly | Admin | NoMulti | Stale,
+		Categories: []string{"admin", "slow", "dangerous"},
+		Summary:    "The former name of REPLICAOF.",
+		Handler:    cmdReplicaOf,
+	})
+}
+
+func cmdReplicaOf(c *Ctx) resp.Value {
+	host, port := string(c.Arg(1)), string(c.Arg(2))
+	if strings.EqualFold(host, "no") && strings.EqualFold(port, "one") {
+		if err := c.Host.Follow("", 0); err != nil {
+			return resp.Err("ERR " + err.Error())
+		}
+		return resp.OK()
+	}
+	n, err := resp.ParseInt(c.Arg(2))
+	if err != nil || n <= 0 || n > 65535 {
+		return resp.Err("ERR Invalid master port")
+	}
+	if host == "" {
+		return resp.Err("ERR Invalid master host")
+	}
+	if err := c.Host.Follow(host, int(n)); err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	return resp.OK()
 }
 
 // cmdReplConf accepts the options a replica announces before PSYNC.

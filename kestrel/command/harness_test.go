@@ -25,6 +25,10 @@ type testHost struct {
 
 	persistErr  error
 	snapshotErr error
+	followErr   error
+
+	followHost string // guarded by mu
+	followPort int    // guarded by mu
 
 	snapshots           atomic.Int64
 	backgroundSnapshots atomic.Int64
@@ -114,7 +118,19 @@ func (h *testHost) Snapshot(background bool) error {
 	return nil
 }
 
-func (h *testHost) LastSave() int64      { return h.lastSave.Load() }
+func (h *testHost) LastSave() int64 { return h.lastSave.Load() }
+
+// Follow records what REPLICAOF asked for. The replication machinery has its
+// own tests against a real socket; these are about the command.
+func (h *testHost) Follow(host string, port int) error {
+	if h.followErr != nil {
+		return h.followErr
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.followHost, h.followPort = host, port
+	return nil
+}
 func (h *testHost) StartTime() time.Time { return h.start }
 
 func (h *testHost) ApplyRuntimeConfig() {

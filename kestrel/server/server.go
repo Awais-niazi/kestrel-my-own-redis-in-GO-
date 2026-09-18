@@ -59,7 +59,13 @@ type Server struct {
 
 	replicasMu sync.Mutex
 	replicas   map[uint64]*replicaLink
-	replica    atomic.Bool
+
+	// replicaMu guards the link to this server's own leader, when it has
+	// one. It is separate from replicasMu: that one is about the replicas
+	// following this server, this one about the server this one follows.
+	replicaMu sync.Mutex
+	replica   *replicaState
+	isReplica atomic.Bool
 
 	quit         chan struct{}
 	shutdownOnce sync.Once
@@ -174,7 +180,7 @@ func (s *Server) Stats() *command.Stats { return s.stats }
 func (s *Server) StartTime() time.Time { return s.startTime }
 
 // IsReplica reports whether this node follows a leader.
-func (s *Server) IsReplica() bool { return s.replica.Load() }
+func (s *Server) IsReplica() bool { return s.isReplica.Load() }
 
 // IsLoading reports whether the dataset is still being read from disk.
 func (s *Server) IsLoading() bool { return s.loading.Load() }
@@ -273,6 +279,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		p.sizeAtSave.Store(p.log.Stats().Size)
 		s.workers.Add(1)
 		go s.maintenance(p)
+		s.startReplication(snap.ReplicaOf)
 		s.log.Info("persistence is on", "dir", p.dir,
 			"appendfsync", snap.AppendFsync,
 			"snapshot_interval_seconds", snap.SnapshotInterval)
@@ -325,6 +332,7 @@ func (s *Server) drain(snap *config.Values) error {
 	}
 
 	s.unblockClients()
+	s.stopReplication()
 
 	done := make(chan struct{})
 	go func() {

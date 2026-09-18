@@ -20,7 +20,7 @@ durability all work.
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
 | M3 | Append log, snapshots, recovery, compaction | done |
-| M4 | Replication | not started |
+| M4 | Replication | in progress: leader and replica links work; WAIT and replica persistence remain |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
@@ -149,6 +149,10 @@ RESP3) `QUIT` `RESET` `CLIENT ID|GETNAME|SETNAME|INFO|NO-EVICT|HELP`
 
 **Persistence** `SAVE` `BGSAVE` `BGREWRITEAOF` `LASTSAVE` — all three saves
 are one operation here, which `docs/deviations.md` explains
+
+**Replication** `REPLICAOF` `SLAVEOF` `REPLCONF` `PSYNC` — a replica is fed
+straight from the leader's log segments, so a partial resynchronisation is a
+seek and there is no separate backlog to size
 
 **Operations** protected mode, `requirepass`, TLS and mutual TLS,
 `rename-command`, structured JSON logs, graceful shutdown, a separate admin
