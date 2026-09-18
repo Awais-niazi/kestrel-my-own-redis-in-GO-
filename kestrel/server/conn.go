@@ -218,12 +218,22 @@ func (c *connection) loop() {
 		command.Execute(s, c.cl, args)
 
 		// Keep draining the pipeline before paying for a write syscall.
-		if !c.rd.Buffered() || c.cl.CloseAfterReply {
+		if !c.rd.Buffered() || c.cl.CloseAfterReply || c.cl.PSync != nil {
 			if err := c.wr.Flush(); err != nil {
 				return
 			}
 		}
 		if c.cl.CloseAfterReply {
+			return
+		}
+
+		// PSYNC takes the connection out of the command loop for good. The
+		// socket stops carrying commands and replies and starts carrying a
+		// record stream, so this goroutine hands it over and does not come
+		// back.
+		if req := c.cl.PSync; req != nil {
+			c.cl.PSync = nil
+			s.serveReplica(c, req)
 			return
 		}
 	}

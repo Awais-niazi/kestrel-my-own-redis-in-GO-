@@ -680,3 +680,60 @@ The channel is taken *before* the offset it is waiting past is re-checked. The
 other order has a race that loses a record: the follower reads the offset,
 a write lands, and only then does it subscribe -- and it then sleeps with data
 available.
+
+---
+
+## 13. A full resynchronisation is the restart path, sent over a socket
+
+The leader answers `PSYNC` in one of two ways, and neither is a new
+mechanism.
+
+**Partial.** The replica quotes this leader's replication id and an offset
+that is still retained, so the link resumes with a seek into a segment and no
+transfer at all. Issue 12 covers why that is a seek rather than a scan.
+
+**Full.** The leader sends the current snapshot file, then the log from that
+snapshot's earliest anchor. That is exactly the pair of files a restart
+reads, and the replica applies them with exactly the code a restart uses:
+`LoadSnapshot`, then a filtered replay of the stream. The per-shard anchors
+travel inside the snapshot, so the filter a replica needs arrives with the
+data it filters.
+
+A consequence worth stating: **the leader does not take a snapshot per
+replica.** Pruning never removes a segment below the current snapshot's first
+anchor, so the snapshot already on disk plus the log after it is always a
+complete and consistent full sync. A fresh one is taken only if none has ever
+been written.
+
+### Records travel in their on-disk framing, not as RESP commands
+
+The stream after the handshake is the framed records themselves. So the
+checksum a replica verifies is the one the leader wrote, over the bytes the
+leader wrote -- not one recomputed from arguments that have already been
+decoded and assumed correct. The database index travels in the frame, so
+there are no `SELECT` records to interleave and no per-connection database
+state to keep in step.
+
+It also means the bytes on the wire are the bytes in the file, so a replica's
+log is identical to the leader's for the range they share.
+
+### Acknowledgements travel the other way on the same connection
+
+A replication link is a stream in one direction and a trickle of `REPLCONF
+ACK` in the other. The leader reads them on a second goroutine, which is safe
+because a `net.Conn` supports concurrent reads and writes, and cancels the
+link when that read ends -- a replica that has gone away stops being detected
+by a failed write alone, which may not happen until the next write.
+
+`REPLCONF ACK` is the one command that must not be replied to. Its reply
+would be written into a socket the replica is parsing as a record stream, and
+would be read as a corrupt frame.
+
+### The handover
+
+`PSYNC` cannot be served by a command handler, because a handler returns a
+reply and this connection stops having replies. The handler records what was
+asked for on the client and returns nothing; the connection loop sees the
+request, flushes, and hands the socket to the replication code without
+returning to the loop. The command layer decides that a handover is wanted;
+the server decides whether it can be granted.

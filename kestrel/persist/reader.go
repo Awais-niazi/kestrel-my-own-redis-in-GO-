@@ -22,6 +22,12 @@ type Record struct {
 	Args   [][]byte
 	Offset uint64 // stream offset of this record
 	Size   int    // encoded size, header included
+	// Raw is the framed record exactly as it appears in the file, and is
+	// filled only when KeepRaw has been set. Replication forwards it
+	// unchanged rather than re-encoding: the checksum a replica verifies is
+	// then the one the leader wrote, not one computed again from decoded
+	// arguments that were assumed to be right.
+	Raw []byte
 }
 
 // Reader iterates the records of a log file.
@@ -31,8 +37,29 @@ type Reader struct {
 	off  uint64 // stream offset of the next record to read
 	hdr  [recordHeaderSize]byte
 	buf  []byte
+	raw  []byte
+	keep bool
 	rec  Record
 	err  error
+}
+
+// KeepRaw makes Next fill Record.Raw. It costs a copy per record, so it is
+// off for recovery, which reads millions and needs none of them, and on for
+// replication, which forwards every one.
+func (r *Reader) KeepRaw(v bool) { r.keep = v }
+
+// NewRecordStream reads framed records from a stream that has no file
+// header, which is what a replication link carries.
+//
+// at is the stream offset of the first record, so that a replica can report
+// its position using the leader's numbering.
+func NewRecordStream(src io.Reader, at uint64) *Reader {
+	return &Reader{
+		src:  bufio.NewReaderSize(src, 64<<10),
+		base: at,
+		off:  at,
+		buf:  make([]byte, 0, 4096),
+	}
 }
 
 // NewReader validates a log file header and returns a reader positioned at
@@ -178,6 +205,10 @@ func (r *Reader) Next() bool {
 	}
 
 	r.rec = Record{DB: db, Kind: kind, Args: args, Offset: r.off, Size: recordHeaderSize + size}
+	if r.keep {
+		r.raw = append(append(r.raw[:0], r.hdr[:]...), p...)
+		r.rec.Raw = r.raw
+	}
 	r.off += uint64(r.rec.Size)
 	return true
 }

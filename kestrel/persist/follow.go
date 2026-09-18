@@ -40,9 +40,19 @@ type Follower struct {
 	log *Log
 	off uint64
 
-	f   *os.File
-	r   *Reader
-	seg Segment
+	f       *os.File
+	r       *Reader
+	seg     Segment
+	keepRaw bool
+}
+
+// KeepRaw makes the follower fill Record.Raw, which replication forwards
+// unchanged.
+func (f *Follower) KeepRaw(v bool) {
+	f.keepRaw = v
+	if f.r != nil {
+		f.r.KeepRaw(v)
+	}
 }
 
 // Follow starts reading log at from.
@@ -74,6 +84,7 @@ func (f *Follower) seek(at uint64) error {
 		if err != nil {
 			return err
 		}
+		r.KeepRaw(f.keepRaw)
 		f.f, f.r, f.seg = file, r, s
 		return nil
 	}

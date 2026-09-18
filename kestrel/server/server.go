@@ -56,7 +56,10 @@ type Server struct {
 
 	loading atomic.Bool
 	persist *persistence
-	replica atomic.Bool
+
+	replicasMu sync.Mutex
+	replicas   map[uint64]*replicaLink
+	replica    atomic.Bool
 
 	quit         chan struct{}
 	shutdownOnce sync.Once

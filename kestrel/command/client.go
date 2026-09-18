@@ -40,6 +40,19 @@ type Client struct {
 	// reply has been flushed, which is how QUIT and protocol errors end.
 	CloseAfterReply bool
 
+	// ReplicaPort is the port a replica announced with REPLCONF
+	// listening-port, so that INFO can name it as an address rather than as
+	// the ephemeral port its outbound connection happens to use.
+	ReplicaPort int
+	// ReplicaAck is the stream offset a replica has reported applying. It is
+	// written by the connection's own goroutine and read by WAIT from
+	// another, so it is atomic.
+	ReplicaAck atomic.Uint64
+	// PSync, when set by the PSYNC handler, asks the server to take this
+	// connection out of the command loop and feed it the replication
+	// stream.
+	PSync *PSyncRequest
+
 	// Replica marks a connection that has been promoted to a replication
 	// link and must no longer be treated as a normal client.
 	Replica bool

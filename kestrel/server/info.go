@@ -2,8 +2,10 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -226,10 +228,59 @@ func (s *Server) infoReplication(b *strings.Builder) {
 		role = "slave"
 	}
 	kv(b, "role", role)
-	kv(b, "connected_slaves", 0)
-	kv(b, "master_replid", command.RunID())
-	kv(b, "master_repl_offset", 0)
-	kv(b, "repl_backlog_active", 0)
+
+	links := s.replicaLinks()
+	kv(b, "connected_slaves", len(links))
+	for i, l := range links {
+		// The announced listening port is used rather than the ephemeral
+		// one the replica's outbound connection happens to hold, so the
+		// address in INFO is one an operator can actually connect to.
+		port := l.port
+		if port == 0 {
+			port = portOf(l.addr)
+		}
+		kv(b, fmt.Sprintf("slave%d", i), fmt.Sprintf(
+			"ip=%s,port=%d,state=%s,offset=%d,lag=%d",
+			hostOf(l.addr), port, l.status(), l.ack.Load(),
+			int64(time.Since(l.since).Seconds())))
+	}
+
+	kv(b, "master_replid", s.ReplID())
+	kv(b, "master_repl_offset", s.replicationOffset())
+
+	// There is no separate backlog to be active or inactive: a replica is
+	// served from the log segments themselves. The fields report what that
+	// means in practice -- how far back a partial resynchronisation can
+	// reach.
+	kv(b, "repl_backlog_active", boolInt(s.persist != nil))
+	if p := s.persist; p != nil && p.log != nil {
+		kv(b, "repl_oldest_offset", p.log.OldestOffset())
+		kv(b, "repl_backlog_histlen", s.replicationOffset()-p.log.OldestOffset())
+	}
+}
+
+// replicationOffset is the stream offset every write has reached.
+func (s *Server) replicationOffset() uint64 {
+	if s.persist == nil || s.persist.log == nil {
+		return 0
+	}
+	return s.persist.log.Offset()
+}
+
+func hostOf(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+func portOf(addr string) int {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		if n, err := strconv.Atoi(p); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func (s *Server) infoCPU(b *strings.Builder) {
