@@ -196,6 +196,15 @@ func resolve(host Host, cl *Client, args [][]byte) (*Descriptor, resp.Value) {
 		table.recordRejected(d)
 		return nil, errNoAuth
 	}
+	// Permissions are checked after authentication and before anything
+	// else, because a user who may not run a command should be told that
+	// and not, say, that their arguments are wrong.
+	if !d.Is(NoAuth) {
+		if reply, ok := checkPermissions(host, cl, d, args); !ok {
+			table.recordRejected(d)
+			return nil, reply
+		}
+	}
 	if host.IsLoading() && !d.Is(Loading) {
 		table.recordRejected(d)
 		return nil, errLoading
@@ -299,4 +308,52 @@ func propagate(host Host, cl *Client, ctx *Ctx, d *Descriptor, args [][]byte) {
 		cp[i] = b
 	}
 	host.Propagate(cl.DBIndex, cp...)
+}
+
+// checkPermissions applies the caller's ACL to one command.
+//
+// Three questions, in the order that gives the most useful answer first: may
+// they run it at all, may they touch these keys, may they use these
+// channels. Reporting the key refusal for a command they could never run
+// would send an operator to fix the wrong rule.
+func checkPermissions(host Host, cl *Client, d *Descriptor, args [][]byte) (resp.Value, bool) {
+	u := cl.Perms
+	if u == nil {
+		return resp.Value{}, true
+	}
+	if !u.CanRun(d) {
+		return errNoPermCommand(cl.User, d.FullName()), false
+	}
+	if u.Unrestricted() {
+		return resp.Value{}, true
+	}
+	for _, k := range ExtractKeys(d, args) {
+		if !u.CanAccessKey(k) {
+			return errNoPermKey(cl.User), false
+		}
+	}
+	for _, ch := range channelArgs(d, args) {
+		if !u.CanAccessChannel(ch) {
+			return errNoPermChannel(cl.User), false
+		}
+	}
+	return resp.Value{}, true
+}
+
+// channelArgs returns the channel or pattern arguments of a Pub/Sub command.
+//
+// Channels are not keys and have their own permission, so they cannot be
+// found through the key specification. The list is short and explicit
+// because guessing from the command name would silently stop covering a
+// command added later.
+func channelArgs(d *Descriptor, args [][]byte) [][]byte {
+	switch d.Name {
+	case "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE":
+		return args[1:]
+	case "PUBLISH":
+		if len(args) >= 2 {
+			return args[1:2]
+		}
+	}
+	return nil
 }

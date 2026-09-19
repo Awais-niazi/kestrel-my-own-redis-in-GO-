@@ -24,7 +24,7 @@ durability all work.
 | M4 | Replication | done |
 | M5 | Pub/Sub, transactions, blocking commands | done |
 | M6 | `maxmemory`, eviction, full metrics | done |
-| M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
+| M7 | RESP3, TLS, ACL, hardening | done |
 
 ### What durability means here
 
@@ -147,6 +147,10 @@ RESP3) `QUIT` `RESET` `CLIENT ID|GETNAME|SETNAME|INFO|NO-EVICT|HELP`
 **Server** `INFO` `CONFIG GET|SET|RESETSTAT` `COMMAND` (`COUNT` `INFO` `DOCS`
 `GETKEYS`) `SLOWLOG` `MEMORY USAGE|DOCTOR` `OBJECT` `DEBUG` `TIME` `SHUTDOWN`
 `MONITOR` `CLUSTER INFO|MYID|SLOTS|SHARDS`
+
+**Access control** `ACL WHOAMI|LIST|USERS|GETUSER|SETUSER|DELUSER|CAT|GENPASS|HELP`
+`AUTH` — rules are applied in order, and refusals say whether a command, a
+key or a channel was the problem
 
 **Clients** `CLIENT ID|GETNAME|SETNAME|INFO|LIST|KILL|NO-EVICT|NO-TOUCH|HELP`
 — `LIST` and `KILL` share one filter parser, so `LIST` cannot accept a filter

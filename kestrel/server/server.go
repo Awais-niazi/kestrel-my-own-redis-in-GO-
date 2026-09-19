@@ -72,6 +72,7 @@ type Server struct {
 	watchers *command.Watchers
 	blocked  *command.Blocked
 	monitors *command.Monitors
+	acl      *command.ACL
 
 	quit         chan struct{}
 	shutdownOnce sync.Once
@@ -114,6 +115,8 @@ func New(cfg *config.Config) (*Server, error) {
 		blocked:   command.NewBlocked(),
 		monitors:  command.NewMonitors(),
 	}
+	s.acl = command.NewACL(table)
+	s.acl.SetDefaultPassword(snap.RequirePass)
 	var el EffectLog = &discardLog{}
 	s.effects.Store(&el)
 
@@ -159,6 +162,9 @@ func (s *Server) ApplyRuntimeConfig() {
 	s.stats.Slowlog.SetCapacity(snap.SlowlogMaxLen)
 	s.ks.SetThresholds(encodingThresholds(snap))
 	s.applyEviction(snap)
+	// requirepass and the default user are two spellings of the same
+	// thing, so a CONFIG SET of one moves the other.
+	s.acl.SetDefaultPassword(snap.RequirePass)
 	if p := s.persist; p != nil && p.log != nil {
 		if f, err := persist.ParseFsync(snap.AppendFsync); err == nil {
 			p.log.SetFsync(f)
@@ -222,6 +228,9 @@ func (s *Server) PubSub() *command.PubSub { return s.pubsub }
 
 // Watchers returns the WATCH registry.
 func (s *Server) Watchers() *command.Watchers { return s.watchers }
+
+// ACL returns the access control registry.
+func (s *Server) ACL() *command.ACL { return s.acl }
 
 // Blocked returns the registry of clients waiting on keys.
 func (s *Server) Blocked() *command.Blocked { return s.blocked }

@@ -50,6 +50,8 @@ type Host interface {
 	Blocked() *Blocked
 	// Monitors returns the set of clients watching the command stream.
 	Monitors() *Monitors
+	// ACL returns the access control registry.
+	ACL() *ACL
 	// ForEachClient calls fn for every connected client, for CLIENT LIST
 	// and CLIENT KILL.
 	ForEachClient(fn func(*Client))

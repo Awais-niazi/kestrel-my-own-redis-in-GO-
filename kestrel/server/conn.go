@@ -114,6 +114,11 @@ func (s *Server) serveConn(nc net.Conn) {
 		s.ks.DB(0),
 		snap.RequirePass == "",
 	)
+	// A new connection acts as the default user until AUTH says otherwise.
+	// That is what makes an unconfigured server behave as though there were
+	// no access control at all: the default user can do anything, so every
+	// check passes.
+	c.cl.Perms = s.acl.Default()
 
 	s.registerConn(c)
 	defer func() {

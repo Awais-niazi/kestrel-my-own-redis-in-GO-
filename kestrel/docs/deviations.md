@@ -235,3 +235,21 @@ broadcast. It is a contained change if it turns out to matter.
 The multi-key pop family added in Redis 7 is out of scope for this version,
 along with its blocking variants. `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`,
 `BZPOPMIN` and `BZPOPMAX` cover the same ground for one key at a time.
+
+## ACL selectors and read/write key patterns are not implemented
+
+`ACL SETUSER` accepts the rules that grant and revoke commands, categories,
+key patterns and channel patterns, and the password and flag rules. It does
+not accept:
+
+- **Selectors**, the `(...)` syntax that gives a user an alternate set of
+  permissions to fall back on.
+- **`%R~pattern` and `%W~pattern`**, which grant read-only or write-only
+  access to a key pattern. `~pattern` grants both.
+
+An unrecognised rule is refused and the whole `ACL SETUSER` fails, so a rule
+from either of these cannot be silently ignored -- which is the failure mode
+that matters, since a silently dropped restriction is a permission granted.
+
+There is no `aclfile`. Users are defined at runtime with `ACL SETUSER`, and
+`requirepass` continues to configure the default user.

@@ -9,11 +9,15 @@ import (
 	"kestrel/resp"
 )
 
-// arr renders an array reply for comparison.
+// arr renders an array reply for comparison, descending into nested arrays
+// so that a map-shaped reply like ACL GETUSER is readable.
 func arr(v resp.Value) string {
+	if len(v.Elems) == 0 {
+		return text(v)
+	}
 	parts := make([]string, len(v.Elems))
 	for i, e := range v.Elems {
-		parts[i] = text(e)
+		parts[i] = arr(e)
 	}
 	return strings.Join(parts, " ")
 }

@@ -149,19 +149,21 @@ func cmdAuth(c *Ctx) resp.Value {
 }
 
 func authenticate(c *Ctx, user, pass string) resp.Value {
-	cfg := c.Host.Config().Snapshot()
-	if cfg.RequirePass == "" {
+	acl := c.Host.ACL()
+	u := acl.User(user)
+	// A server with no password and no ACL users has nothing to
+	// authenticate against, and says so rather than failing as though the
+	// password were wrong.
+	if user == "default" && u != nil && u.NoPass() &&
+		c.Host.Config().Snapshot().RequirePass == "" {
 		return errAuthNotSet
 	}
-	// A constant-time comparison is not meaningful here: the reply itself
-	// tells the caller whether the password matched, and the connection is
-	// not rate limited by timing. Keeping it simple avoids implying a
-	// property the design does not have.
-	if user != "default" || pass != cfg.RequirePass {
+	if u == nil || !u.CheckPassword(pass) {
 		return errAuthFailed
 	}
 	c.Client.Authenticated = true
 	c.Client.User = user
+	c.Client.Perms = u
 	return resp.OK()
 }
 

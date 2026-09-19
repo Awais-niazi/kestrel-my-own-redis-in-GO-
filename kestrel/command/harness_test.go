@@ -31,6 +31,7 @@ type testHost struct {
 	watchers    *Watchers
 	blocked     *Blocked
 	monitors    *Monitors
+	acl         *ACL
 	clients     []*Client // guarded by mu
 	killed      []uint64  // guarded by mu
 	quit        chan struct{}
@@ -94,9 +95,10 @@ func newTestHost(t *testing.T, tweaks ...func(*config.Config)) *testHost {
 
 	h := &testHost{cfg: cfg, ks: ks, table: table, stats: NewStats(128),
 		start: time.Now(), pubsub: NewPubSub(), watchers: NewWatchers(),
-		blocked: NewBlocked(), monitors: NewMonitors(),
+		blocked: NewBlocked(), monitors: NewMonitors(), acl: NewACL(table),
 		quit: make(chan struct{})}
 	h.ApplyRuntimeConfig()
+	h.acl.SetDefaultPassword(snap.RequirePass)
 	h.now.Store(1_700_000_000_000)
 	ks.SetClock(func() int64 { return h.now.Load() })
 	ks.SetEffectSink(hostSink{h})
@@ -140,6 +142,7 @@ func (h *testHost) PubSub() *PubSub     { return h.pubsub }
 func (h *testHost) Watchers() *Watchers { return h.watchers }
 func (h *testHost) Blocked() *Blocked   { return h.blocked }
 func (h *testHost) Monitors() *Monitors { return h.monitors }
+func (h *testHost) ACL() *ACL           { return h.acl }
 
 // ForEachClient and Disconnect are backed by a list the tests populate, so
 // CLIENT LIST and CLIENT KILL can be exercised without sockets.
@@ -255,6 +258,7 @@ func newSession(t *testing.T, h *testHost) *session {
 	w := resp.NewWriter(buf)
 	snap := h.cfg.Snapshot()
 	cl := NewClient(1, "127.0.0.1:1234", "127.0.0.1:6380", w, h.ks.DB(0), snap.RequirePass == "")
+	cl.Perms = h.acl.Default()
 	return &session{t: t, h: h, cl: cl, out: buf, wr: w, rr: resp.NewReplyReader(buf)}
 }
 

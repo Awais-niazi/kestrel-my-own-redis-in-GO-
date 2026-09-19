@@ -152,6 +152,10 @@ type Descriptor struct {
 
 	parent   *Descriptor
 	fullName string
+	// lowerName is fullName folded once at registration. The ACL check
+	// runs on every command, and folding it there put two allocations on
+	// the path of every GET.
+	lowerName string
 	// index addresses this command's counters inside a Table. It is
 	// assigned once at registration so that per-command accounting is an
 	// array index rather than a map lookup under a mutex.
@@ -161,6 +165,9 @@ type Descriptor struct {
 // FullName is the name used in errors and in COMMAND replies. It is computed
 // once at registration so that the dispatch path never builds a string.
 func (d *Descriptor) FullName() string { return d.fullName }
+
+// LowerName is FullName folded to lower case, also computed once.
+func (d *Descriptor) LowerName() string { return d.lowerName }
 
 // Is reports whether every flag in f is set.
 func (d *Descriptor) Is(f Flag) bool { return d.Flags&f == f }
@@ -199,6 +206,7 @@ func validate(d *Descriptor) {
 	if d.parent != nil {
 		d.fullName = d.parent.Name + "|" + d.Name
 	}
+	d.lowerName = strings.ToLower(d.fullName)
 	where := d.fullName
 	if d.Arity == 0 {
 		panic("command: " + where + " has no arity")
@@ -227,6 +235,13 @@ func validate(d *Descriptor) {
 	for name, sub := range d.Subcommands {
 		sub.Name = strings.ToUpper(name)
 		sub.parent = d
+		// A subcommand with no categories of its own belongs to its
+		// parent's. Without this an ACL rule like -@admin removes CONFIG
+		// but leaves CONFIG GET, which is the whole of CONFIG still
+		// reachable through a name the rule appeared to cover.
+		if len(sub.Categories) == 0 {
+			sub.Categories = d.Categories
+		}
 		validate(sub)
 	}
 }

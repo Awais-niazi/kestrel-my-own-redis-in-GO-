@@ -125,3 +125,21 @@ func errSubscriberMode(name string) resp.Value {
 
 // errTimeout refuses a blocking command whose timeout argument is unusable.
 var errTimeout = resp.Err("ERR timeout is not a float or out of range")
+
+// The three NOPERM refusals name the user and what was refused. "NOPERM"
+// alone leaves an operator to work out which of a user's rules is in the
+// way, which is the whole difficulty of debugging an ACL.
+func errNoPermCommand(user, command string) resp.Value {
+	return resp.Err("NOPERM User " + user + " has no permissions to run the '" +
+		strings.ToLower(command) + "' command")
+}
+
+func errNoPermKey(user string) resp.Value {
+	return resp.Err("NOPERM No permissions to access one of the keys used as " +
+		"arguments (user " + user + ")")
+}
+
+func errNoPermChannel(user string) resp.Value {
+	return resp.Err("NOPERM No permissions to access one of the channels used as " +
+		"arguments (user " + user + ")")
+}

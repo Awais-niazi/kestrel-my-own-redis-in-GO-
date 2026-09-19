@@ -71,6 +71,11 @@ type Client struct {
 	// monitoring reports that this client is watching the command stream.
 	monitoring atomic.Bool
 
+	// Perms is the ACL user this connection is acting as. It is replaced by
+	// AUTH and never mutated, so the dispatcher reads a consistent set of
+	// permissions even while ACL SETUSER is rewriting them.
+	Perms *User
+
 	// inMulti reports that commands are being queued rather than run.
 	inMulti bool
 	// multiAborted records that something could not be queued, so EXEC must

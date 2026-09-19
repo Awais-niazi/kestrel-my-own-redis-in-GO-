@@ -1241,3 +1241,62 @@ the count is the only thing `CLIENT KILL` returns. A self-kill now sets
 A connection parked in a read, or blocked in `BLPOP`, will not notice a flag.
 `CLIENT KILL` exists precisely for connections that are not behaving, so it
 closes the socket and lets the connection's own goroutine discover it.
+
+---
+
+## 23. ACL: rules are ordered, permissions are resolved
+
+A user is a set of permissions -- which commands, which keys, which channels.
+Two decisions shape the implementation.
+
+**Rules are applied in the order given.** `+@all -@dangerous` and
+`-@dangerous +@all` mean different things, and a user who wrote the first and
+got the second would have granted exactly what they meant to withhold. A test
+pins both directions.
+
+**Permissions are stored resolved, not as rules to interpret.** Each user
+holds a map from command name to whether they may run it, built when the
+rules are set. Checking is then a map lookup on the dispatch path, and a rule
+touching a hundred commands costs once rather than per command.
+
+`ACL SETUSER` applies to a copy and replaces the original only if every rule
+is understood. A half-applied list is a user with permissions nobody wrote
+down, and the operator who made a typo would be left guessing which of their
+rules took effect.
+
+### Subcommands inherit their parent's categories
+
+`-@admin` removed `CONFIG` and left `CONFIG GET` reachable, because the
+subcommands declared no categories of their own and so matched no category
+rule. The whole of `CONFIG` was still available through a name the rule
+appeared to cover.
+
+A subcommand with no categories now inherits its parent's. Separately, a rule
+naming a container grants or revokes its children too: a user who could run
+neither `CONFIG GET` nor `CONFIG SET` has not been granted `CONFIG`.
+
+### The ACL check cost two allocations on every GET
+
+`CanRun` folded the command's name to lower case on each call, and the key
+check extracted a command's keys before comparing them against "allow
+everything". Both were on the path of every command.
+
+The name is now folded once at registration, and a user who may touch every
+key and every channel short-circuits before any key is extracted. That is the
+default user on a server with no access control configured -- the
+overwhelmingly common case, and the one that must cost nothing. `GET` is back
+to zero allocations.
+
+### requirepass and the default user are the same thing
+
+An operator who sets `requirepass` expects authentication to work without
+learning about ACLs, so setting it sets the default user's password, and
+clearing it restores `nopass`. `CONFIG SET requirepass` moves both.
+
+### What is not implemented
+
+Selectors -- the `(...)` syntax for alternate permission sets -- and the
+`%R~` / `%W~` read-only and write-only key patterns. Both are recorded in
+`docs/deviations.md`. Passwords are SHA-256 hashed as in the reference
+implementation, compared in constant time, and never stored or reported in
+plaintext.
