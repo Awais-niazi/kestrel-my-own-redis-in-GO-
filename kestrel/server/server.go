@@ -67,6 +67,8 @@ type Server struct {
 	replica   *replicaState
 	isReplica atomic.Bool
 
+	pubsub *command.PubSub
+
 	quit         chan struct{}
 	shutdownOnce sync.Once
 	shutdownErr  error
@@ -103,6 +105,7 @@ func New(cfg *config.Config) (*Server, error) {
 		startTime: time.Now(),
 		clients:   make(map[uint64]*connection),
 		quit:      make(chan struct{}),
+		pubsub:    command.NewPubSub(),
 	}
 	var el EffectLog = &discardLog{}
 	s.effects.Store(&el)
@@ -181,6 +184,9 @@ func (s *Server) StartTime() time.Time { return s.startTime }
 
 // IsReplica reports whether this node follows a leader.
 func (s *Server) IsReplica() bool { return s.isReplica.Load() }
+
+// PubSub returns the subscription registry.
+func (s *Server) PubSub() *command.PubSub { return s.pubsub }
 
 // IsLoading reports whether the dataset is still being read from disk.
 func (s *Server) IsLoading() bool { return s.loading.Load() }

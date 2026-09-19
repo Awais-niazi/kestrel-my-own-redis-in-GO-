@@ -40,9 +40,10 @@ const (
 	Fast
 	// Blocking marks a command that can park the client.
 	Blocking
-	// PubSub marks a command permitted while a RESP2 client is in
-	// subscriber mode.
-	PubSub
+	// SubscriberOK marks a command permitted while a RESP2 client is in
+	// subscriber mode. It is reported as "pubsub" by COMMAND, which is the
+	// name the reference implementation gives it.
+	SubscriberOK
 	// NoScript is reserved for parity with the reference command table.
 	NoScript
 )
@@ -54,7 +55,7 @@ var flagNames = []struct {
 	{Write, "write"}, {Readonly, "readonly"}, {Admin, "admin"},
 	{DenyOOM, "denyoom"}, {NoMulti, "no-multi"}, {Loading, "loading"},
 	{Stale, "stale"}, {NoAuth, "no-auth"}, {Fast, "fast"},
-	{Blocking, "blocking"}, {PubSub, "pubsub"}, {NoScript, "noscript"},
+	{Blocking, "blocking"}, {SubscriberOK, "pubsub"}, {NoScript, "noscript"},
 }
 
 // EffectKind declares how a write command reaches the append log and the

@@ -115,3 +115,10 @@ func errNotEnoughReplicas(have, need int) resp.Value {
 	return resp.Err("NOREPLICAS Not enough good replicas to write. " +
 		itoa(have) + " in sync, " + itoa(need) + " required.")
 }
+
+// errSubscriberMode refuses a command a RESP2 subscriber may not send.
+func errSubscriberMode(name string) resp.Value {
+	return resp.Err("ERR Can't execute '" + strings.ToLower(name) +
+		"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are " +
+		"allowed in this context")
+}

@@ -42,6 +42,8 @@ type Host interface {
 	// Follow makes this server a replica of host:port, or promotes it to a
 	// leader when host is empty.
 	Follow(host string, port int) error
+	// PubSub returns the server's subscription registry.
+	PubSub() *PubSub
 	// ReplicasInSync counts the replicas acknowledging recently enough to
 	// satisfy min-replicas-to-write.
 	ReplicasInSync() int

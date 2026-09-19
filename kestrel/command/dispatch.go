@@ -148,6 +148,15 @@ func resolve(host Host, cl *Client, args [][]byte) (*Descriptor, resp.Value) {
 		table.recordRejected(d)
 		return nil, errLoading
 	}
+	// A RESP2 subscriber can only speak a handful of commands, because the
+	// connection is carrying pushes the client has no way to tell apart
+	// from replies. RESP3 gives pushes their own type, so the restriction
+	// exists only for RESP2 -- and lifting it there would make every reply
+	// ambiguous.
+	if cl.Subscribed() && cl.Protocol() == resp.RESP2 && !d.Is(SubscriberOK) {
+		table.recordRejected(d)
+		return nil, errSubscriberMode(d.FullName())
+	}
 	if d.Is(Write) {
 		if host.IsReplica() && cfg.ReplicaReadOnly && !cl.Replica {
 			table.recordRejected(d)

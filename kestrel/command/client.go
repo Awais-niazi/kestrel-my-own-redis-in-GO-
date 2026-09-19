@@ -53,6 +53,22 @@ type Client struct {
 	// stream.
 	PSync *PSyncRequest
 
+	// channels and patterns are this client's subscriptions. They live here
+	// rather than in the registry so that unsubscribing everything is a
+	// walk of the client's own sets, but they are only ever touched under
+	// the registry's lock: one place decides what a client is subscribed
+	// to, rather than two that have to agree.
+	channels map[string]struct{}
+	patterns map[string]struct{}
+	// subCount mirrors their total so the dispatcher can ask "is this a
+	// subscriber" on every command without taking the registry's lock.
+	subCount atomic.Int64
+	// outbox carries messages to the connection's delivery goroutine.
+	outbox chan Message
+	// overflowed records that the outbox filled, which means this client is
+	// too slow to keep.
+	overflowed atomic.Bool
+
 	// Replica marks a connection that has been promoted to a replication
 	// link and must no longer be treated as a normal client.
 	Replica bool
@@ -77,6 +93,9 @@ func NewClient(id uint64, addr, localAddr string, out *resp.Writer, db *engine.D
 		Out:           out,
 		Authenticated: authenticated,
 		User:          "default",
+		channels:      make(map[string]struct{}),
+		patterns:      make(map[string]struct{}),
+		outbox:        make(chan Message, outboxDepth),
 	}
 	c.Touch(time.Now())
 	return c

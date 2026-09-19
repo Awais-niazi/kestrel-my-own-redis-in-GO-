@@ -18,7 +18,7 @@ const (
 
 func init() {
 	register(&Descriptor{
-		Name: "PING", Arity: -1, Flags: Readonly | Fast | NoAuth | Loading | Stale | PubSub,
+		Name: "PING", Arity: -1, Flags: Readonly | Fast | NoAuth | Loading | Stale | SubscriberOK,
 		Categories: []string{"fast", "connection"},
 		Summary:    "Returns the server's liveliness response.",
 		Handler:    cmdPing,

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"kestrel/command"
@@ -24,6 +25,13 @@ type connection struct {
 	// deadlineSet records whether a read deadline is currently armed, so the
 	// loop can skip the syscall when no timeout is configured.
 	deadlineSet bool
+
+	// wmu guards wr once a delivery goroutine exists, because from that
+	// point two goroutines write to this connection: this one with command
+	// replies, and that one with pushes. It is taken only while pusher is
+	// non-nil, so an ordinary connection never pays for it.
+	wmu    sync.Mutex
+	pusher chan struct{}
 }
 
 func (s *Server) acceptLoop(l net.Listener) {
@@ -108,7 +116,13 @@ func (s *Server) serveConn(nc net.Conn) {
 	)
 
 	s.registerConn(c)
-	defer s.unregisterConn(c)
+	defer func() {
+		// Subscriptions are dropped before the connection is forgotten, so
+		// the registry can never hold a client whose socket has gone.
+		c.stopPusher()
+		s.pubsub.Remove(c.cl)
+		s.unregisterConn(c)
+	}()
 
 	s.log.Debug("client connected", "id", c.cl.ID, "addr", c.cl.Addr)
 	c.loop()
@@ -215,13 +229,26 @@ func (c *connection) loop() {
 		}
 		c.cl.Touch(time.Now())
 
-		command.Execute(s, c.cl, args)
+		c.execute(args)
 
 		// Keep draining the pipeline before paying for a write syscall.
 		if !c.rd.Buffered() || c.cl.CloseAfterReply || c.cl.PSync != nil {
-			if err := c.wr.Flush(); err != nil {
+			if err := c.flush(); err != nil {
 				return
 			}
+		}
+
+		// A client that has just subscribed needs a goroutine to push to
+		// it, because this one is about to block in a read. It is started
+		// after the reply has been flushed, so the confirmation cannot be
+		// overtaken by a message about the channel it confirms.
+		if c.pusher == nil && c.cl.Subscribed() {
+			c.startPusher()
+		}
+		if c.cl.Overflowed() {
+			c.srv.log.Warn("disconnecting a subscriber that fell too far behind",
+				"client", c.cl.Addr)
+			return
 		}
 		if c.cl.CloseAfterReply {
 			return
@@ -293,5 +320,73 @@ func (s *Server) idleReaper() {
 			}
 			s.clientsMu.Unlock()
 		}
+	}
+}
+
+// execute runs one command, holding the write lock when a delivery goroutine
+// shares the connection.
+func (c *connection) execute(args [][]byte) {
+	if c.pusher == nil {
+		command.Execute(c.srv, c.cl, args)
+		return
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	command.Execute(c.srv, c.cl, args)
+}
+
+func (c *connection) flush() error {
+	if c.pusher == nil {
+		return c.wr.Flush()
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.wr.Flush()
+}
+
+// startPusher begins delivering this client's subscriptions.
+//
+// Messages are written from their own goroutine because this connection's is
+// blocked in a read for almost all of its life. The alternative -- having
+// the publisher write here directly -- would make one slow subscriber a
+// problem for every publisher in the server.
+func (c *connection) startPusher() {
+	stop := make(chan struct{})
+	c.pusher = stop
+	c.srv.workers.Add(1)
+	go func() {
+		defer c.srv.workers.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-c.srv.quit:
+				return
+			case m := <-c.cl.Outbox():
+				if err := c.push(m); err != nil {
+					return
+				}
+			}
+		}
+	}()
+}
+
+// push writes one message and flushes it.
+//
+// Every message is flushed rather than batched. A subscriber is waiting for
+// news, and holding a message back for a buffer that may not fill turns a
+// notification system into a polling one.
+func (c *connection) push(m command.Message) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.wr.WriteValue(command.MessageValue(m))
+	return c.wr.Flush()
+}
+
+// stopPusher ends delivery when the connection closes.
+func (c *connection) stopPusher() {
+	if c.pusher != nil {
+		close(c.pusher)
+		c.pusher = nil
 	}
 }

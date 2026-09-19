@@ -27,6 +27,7 @@ type testHost struct {
 	snapshotErr error
 	followErr   error
 	isReplica   bool
+	pubsub      *PubSub
 
 	replicasInSync atomic.Int64
 	replicasAcked  atomic.Int64
@@ -85,7 +86,8 @@ func newTestHost(t *testing.T, tweaks ...func(*config.Config)) *testHost {
 	})
 	t.Cleanup(ks.Close)
 
-	h := &testHost{cfg: cfg, ks: ks, table: table, stats: NewStats(128), start: time.Now()}
+	h := &testHost{cfg: cfg, ks: ks, table: table, stats: NewStats(128),
+		start: time.Now(), pubsub: NewPubSub()}
 	h.ApplyRuntimeConfig()
 	h.now.Store(1_700_000_000_000)
 	ks.SetClock(func() int64 { return h.now.Load() })
@@ -124,6 +126,8 @@ func (h *testHost) Snapshot(background bool) error {
 }
 
 func (h *testHost) LastSave() int64 { return h.lastSave.Load() }
+
+func (h *testHost) PubSub() *PubSub { return h.pubsub }
 
 // ReplicasInSync and WaitReplicas are driven by fields the tests set, so the
 // command behaviour can be exercised without a second server.

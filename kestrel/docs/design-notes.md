@@ -923,3 +923,64 @@ reconnect that is right; on a *restart* the counter is zero while the offset
 actually asked for came from disk, so the replica silently restarted the
 stream numbering from zero and never caught up. The fix is to resume at the
 offset that was asked for, which is the only one both ends agreed on.
+
+---
+
+## 17. Pub/Sub: who owns the socket, and who pays for a slow reader
+
+A subscriber's connection goroutine spends almost its whole life blocked in a
+read, so something else has to write to it. Two obvious answers are both
+wrong.
+
+**The publisher writes directly.** One slow reader then holds up every
+publisher in the server, because a `write` to a full socket buffer blocks.
+Pub/Sub turns into a distributed liveness problem, and the client that caused
+it is not the one that suffers.
+
+**Every message is buffered per subscriber without limit.** One slow reader
+then becomes an out-of-memory kill for everyone.
+
+So each subscriber gets a **bounded queue and its own delivery goroutine**.
+The publisher does a non-blocking send: if the queue is full the subscriber is
+marked and disconnected, and `PUBLISH` does not count it, because the count is
+the only thing `PUBLISH` tells the caller and reporting a delivery that did
+not happen is worse than reporting none. This is the same trade the reference
+implementation makes with its pub/sub output buffer limit.
+
+Two goroutines then write to one connection, so the writer is behind a mutex
+-- but only once a delivery goroutine exists. An ordinary connection never
+takes it, which matters because it sits on the path every command takes.
+
+The delivery goroutine is started *after* the subscribe confirmation has been
+flushed. Started before, a message about a channel could overtake the
+confirmation that the client had subscribed to it.
+
+### Every message is flushed
+
+A subscriber is waiting for news. Batching messages behind a buffer that may
+never fill turns a notification system into a polling one, so each push is
+flushed on its own.
+
+### A bug the race detector found, and the contract that predicted it
+
+`PUBLISH channel payload` hands the payload straight from the publisher's
+read buffer -- which that connection reuses for its next command. A queued
+message outlives the call and is written by a different goroutine, so the
+first version had one connection overwriting bytes another was serialising.
+
+The engine's concurrency contract says exactly this: arguments alias the read
+buffer and are valid only for the duration of the call. The rule was written
+down two milestones earlier and still took the race detector to enforce. The
+payload is now copied once in `Publish`, at the boundary where it stops
+belonging to the caller, rather than per subscriber.
+
+### Why RESP2 subscribers are restricted and RESP3 ones are not
+
+In RESP2 a message is an ordinary array, indistinguishable from a reply. A
+client that sent `GET` and received an array cannot tell whether it is the
+answer or news about a channel, so a RESP2 subscriber may only send commands
+whose replies it can still account for.
+
+RESP3 gives pushes their own type, so the ambiguity does not exist and
+neither does the restriction. Both are one `Kind` in the writer: the
+difference between the dialects is framing, not content.
