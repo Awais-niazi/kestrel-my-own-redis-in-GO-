@@ -16,17 +16,39 @@ import (
 	"kestrel/resp"
 )
 
-// freePort returns a port that is free right now. There is an inherent race
-// between releasing it and the server binding it, which is acceptable in a
-// test and avoids hard-coding ports that collide across parallel runs.
+// freePort returns a port that is free right now and has not been handed out
+// before in this process.
+//
+// There is an inherent race between releasing a port and the server binding
+// it, which is acceptable in a test. What is not acceptable is handing the
+// same port to two callers, which the kernel will happily do for two
+// consecutive asks: a server given the same number for its client and admin
+// ports fails to start, as a flake, on whichever test drew the short straw.
+var (
+	issuedPortsMu sync.Mutex
+	issuedPorts   = map[int]bool{}
+)
+
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 100; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+
+		issuedPortsMu.Lock()
+		fresh := !issuedPorts[port]
+		issuedPorts[port] = true
+		issuedPortsMu.Unlock()
+		if fresh {
+			return port
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	t.Fatal("could not find an unused port")
+	return 0
 }
 
 type testServer struct {

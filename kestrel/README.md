@@ -23,7 +23,7 @@ durability all work.
 | M3 | Append log, snapshots, recovery, compaction | done |
 | M4 | Replication | done |
 | M5 | Pub/Sub, transactions, blocking commands | done |
-| M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
+| M6 | `maxmemory`, eviction, full metrics | partial: eviction, accounting, `INFO`, `SLOWLOG`, `/metrics`; `MONITOR` and `CLIENT LIST` remain |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
 
 ### What durability means here

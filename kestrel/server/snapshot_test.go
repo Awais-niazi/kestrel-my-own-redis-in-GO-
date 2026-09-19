@@ -331,3 +331,75 @@ func TestSnapshotUnderLoad(t *testing.T) {
 		}
 	}
 }
+
+// TestMaxmemoryEvictsRatherThanRefusing is the difference between a cache
+// and a store: under an eviction policy a write that would exceed the limit
+// makes room instead of failing.
+func TestMaxmemoryEvictsRatherThanRefusing(t *testing.T) {
+	ts := startServer(t)
+	c := ts.connect(t)
+
+	value := strings.Repeat("x", 200)
+	for i := 0; i < 500; i++ {
+		c.do("SET", fmt.Sprintf("k%d", i), value)
+	}
+	used := ts.ks.MemoryEstimate()
+	must(t, ts.cfg.Set("maxmemory", fmt.Sprint(used/2)))
+	must(t, ts.cfg.Set("maxmemory-policy", "allkeys-lru"))
+	ts.ApplyRuntimeConfig()
+
+	for i := 500; i < 700; i++ {
+		if got := text(c.do("SET", fmt.Sprintf("k%d", i), value)); got != "OK" {
+			t.Fatalf("a write under an eviction policy returned %q", got)
+		}
+	}
+	// Eviction runs before a write, so the write that follows it puts the
+	// dataset back over by its own size. The limit is a level the server
+	// returns to, not a ceiling it never crosses, and the margin here is a
+	// few values' worth rather than the tenfold overshoot that would mean
+	// eviction was not keeping up.
+	limit := used / 2
+	if got := ts.ks.MemoryEstimate(); got > limit+4096 {
+		t.Errorf("using %d bytes against a limit of %d", got, limit)
+	}
+	// The most recent writes are the ones that should still be there.
+	if got := text(c.do("GET", "k699")); got == "<nil>" {
+		t.Error("the key written last was evicted")
+	}
+	if got := text(c.do("INFO", "stats")); !strings.Contains(got, "evicted_keys:") {
+		t.Error("INFO does not report evictions")
+	}
+	if ts.ks.Stats().EvictedKeys == 0 {
+		t.Error("nothing was evicted")
+	}
+}
+
+// TestNoevictionRefusesWritesAndKeepsServingReads pins the other half.
+func TestNoevictionRefusesWritesAndKeepsServingReads(t *testing.T) {
+	ts := startServer(t)
+	c := ts.connect(t)
+	value := strings.Repeat("x", 200)
+	for i := 0; i < 300; i++ {
+		c.do("SET", fmt.Sprintf("k%d", i), value)
+	}
+	must(t, ts.cfg.Set("maxmemory", fmt.Sprint(ts.ks.MemoryEstimate()/2)))
+	must(t, ts.cfg.Set("maxmemory-policy", "noeviction"))
+	ts.ApplyRuntimeConfig()
+
+	if got := text(c.do("SET", "another", value)); !strings.HasPrefix(got, "OOM") {
+		t.Errorf("a write over the limit returned %q, want OOM", got)
+	}
+	if got := text(c.do("GET", "k1")); got != value {
+		t.Errorf("reads stopped working: %q", got[:min(len(got), 20)])
+	}
+	if got := text(c.do("DEL", "k1")); got != "1" {
+		t.Errorf("DEL was refused under noeviction: %q", got)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

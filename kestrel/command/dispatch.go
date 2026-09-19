@@ -226,21 +226,30 @@ func resolve(host Host, cl *Client, args [][]byte) (*Descriptor, resp.Value) {
 				return nil, errNotEnoughReplicas(have, need)
 			}
 		}
-		if d.Is(DenyOOM) && overMemoryLimit(host, cfg.MaxMemory, cfg.MaxMemoryPolicy) {
-			table.recordRejected(d)
-			return nil, errOOM
+		// Eviction is given its chance here, before Execute takes any
+		// lock: it takes shard locks of its own and they are not
+		// reentrant, so a command already holding the ordering lock for a
+		// shard that eviction then sampled would deadlock against itself.
+		if d.Is(DenyOOM) && overMemoryLimit(host, cfg.MaxMemory) {
+			host.Keyspace().Evict()
+			if overMemoryLimit(host, cfg.MaxMemory) {
+				table.recordRejected(d)
+				return nil, errOOM
+			}
 		}
 	}
 	return d, resp.Value{}
 }
 
-// overMemoryLimit reports whether a memory-growing write must be refused.
+// overMemoryLimit reports whether the dataset is at or over maxmemory.
 //
-// Under a policy other than noeviction the eviction sampler is expected to
-// make room, so the write proceeds; under noeviction the write is refused and
-// reads keep working (FR-6.3).
-func overMemoryLimit(host Host, maxMemory int64, policy string) bool {
-	if maxMemory <= 0 || policy != "noeviction" {
+// Eviction has already had its chance by the time a refusal follows this, so
+// being over here means the policy could not make room: either it is
+// noeviction, or it is a volatile policy and nothing with a TTL is left.
+// Refusing the write while continuing to serve reads is what FR-6.3 asks
+// for.
+func overMemoryLimit(host Host, maxMemory int64) bool {
+	if maxMemory <= 0 {
 		return false
 	}
 	return host.Keyspace().MemoryEstimate() >= maxMemory

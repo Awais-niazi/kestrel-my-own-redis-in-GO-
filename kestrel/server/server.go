@@ -19,6 +19,7 @@ import (
 	"kestrel/command"
 	"kestrel/config"
 	"kestrel/engine"
+	"kestrel/persist"
 )
 
 // EffectLog receives the canonical effects of every write, in order.
@@ -125,6 +126,7 @@ func New(cfg *config.Config) (*Server, error) {
 	// The GC is told the ceiling derived from maxmemory, so that pressure
 	// shows up as slower collection rather than as an OOM kill (ADR-013).
 	applyMemoryLimit(snap.MaxMemory, snap.MemoryLimitOverheadFactor, s.log)
+	s.applyEviction(snap)
 	if snap.GOGC > 0 {
 		debug.SetGCPercent(snap.GOGC)
 	}
@@ -154,6 +156,26 @@ func (s *Server) ApplyRuntimeConfig() {
 	snap := s.cfg.Snapshot()
 	s.stats.Slowlog.SetCapacity(snap.SlowlogMaxLen)
 	s.ks.SetThresholds(encodingThresholds(snap))
+	s.applyEviction(snap)
+	if p := s.persist; p != nil && p.log != nil {
+		if f, err := persist.ParseFsync(snap.AppendFsync); err == nil {
+			p.log.SetFsync(f)
+		}
+	}
+}
+
+// applyEviction pushes maxmemory and its policy into the engine.
+//
+// The policy is validated by the configuration layer, so a value that does
+// not parse here would mean the two disagree about what is legal -- worth
+// saying out loud rather than silently falling back to no eviction.
+func (s *Server) applyEviction(snap *config.Values) {
+	policy, ok := engine.ParseEvictionPolicy(snap.MaxMemoryPolicy)
+	if !ok {
+		s.log.Error("unknown maxmemory-policy; nothing will be evicted",
+			"policy", snap.MaxMemoryPolicy)
+	}
+	s.ks.SetEviction(policy, snap.MaxMemory, snap.MaxMemorySamples)
 }
 
 type effectSink struct{ s *Server }

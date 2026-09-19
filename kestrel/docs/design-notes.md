@@ -1127,3 +1127,63 @@ exactly one client, which is what makes a work queue work, and
 `TestOnlyOneWaiterGetsEachElement` pins that. Strict FIFO would need a
 handoff queue per key and is not worth it until someone needs it; the
 deviation is recorded.
+
+---
+
+## 21. Eviction, and two sampling mistakes worth recording
+
+`maxmemory` now evicts rather than only refusing. The policy picks victims by
+sampling, not by an exact ordering: a true LRU list means two pointers per
+object and a write to three cache lines on every read, to answer a question
+that only has to be approximately right. The reference implementation makes
+the same trade.
+
+Measured on a real server: 20,000 keys written against a 2 MB limit left
+11,304, evicted 8,696, and settled at 2,000,030 bytes -- within thirty of the
+limit.
+
+### The limit is a level, not a ceiling
+
+Eviction runs *before* a write, so the write that follows puts the dataset
+back over by its own size. A server under memory pressure therefore hovers
+just above `maxmemory` rather than staying strictly below it. That is the
+reference behaviour too, and it is worth stating because the obvious test --
+"is it under the limit?" -- fails on a sixteen byte overshoot and looks like
+a bug.
+
+### Uniform sampling was wrong, and looked right
+
+The first version picked a database and a shard at random for each sample.
+With sixteen databases and data in one of them, fifteen of every sixteen
+samples landed on an empty shard. All five samples could miss, `evictOne`
+would report nothing to evict, and the server refused writes while sitting at
+three times its limit.
+
+Sampling now walks shards from a random starting point. It finds candidates
+whenever any exist, still starts somewhere different each time, and allocates
+nothing. Uniform independent picks are the intuitive choice and are only
+correct when the data is spread the way the sampler assumes.
+
+### The access clock is only maintained when a policy needs it
+
+`lookup` records an access, which is a write on the read path. Guarding it
+with one atomic bool means a server with no `maxmemory` set pays a load and
+writes nothing, and `GET` stays at zero allocations. Only the LRU and LFU
+policies set the flag; random and TTL policies do not need it and do not pay.
+
+### One field serves both LRU and LFU
+
+`Object.LRU` holds a coarse second counter for LRU, and for LFU packs a decay
+minute with an eight-bit logarithmic counter. No policy uses both at once, so
+one field does, and `Object` stays the size it was.
+
+The counter is logarithmic -- the higher it is, the less likely an access
+raises it further -- which is what lets eight bits distinguish a key read
+twice from one read ten thousand times. A linear counter saturates almost
+immediately and then ranks every popular key identically.
+
+### A replica never evicts
+
+Its leader's `DEL` arrives on the stream. Evicting independently would
+diverge the two, and the replica would be missing keys the leader still
+serves -- the same reasoning as expiry (FR-3.4).

@@ -161,7 +161,14 @@ type Keyspace struct {
 	watcher atomic.Pointer[KeyWatcher]
 	replica atomic.Bool
 	loading atomic.Bool
-	limits  limitsHolder
+
+	// eviction is the live maxmemory setting. trackAccess and lfu mirror
+	// what the policy needs, so the read path can decide with one atomic
+	// load instead of reading the whole setting.
+	eviction    evictionHolder
+	trackAccess atomic.Bool
+	lfu         atomic.Bool
+	limits      limitsHolder
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -551,6 +558,7 @@ func (db *DB) lookup(s *shard, key []byte) *Object {
 	if o == nil {
 		return nil
 	}
+	db.ks.touchAccess(o)
 	if db.ks.expired(o) {
 		if db.ks.IsReplica() {
 			// Hide it, but let the leader's DEL do the deleting (FR-3.4).
