@@ -67,7 +67,8 @@ type Server struct {
 	replica   *replicaState
 	isReplica atomic.Bool
 
-	pubsub *command.PubSub
+	pubsub   *command.PubSub
+	watchers *command.Watchers
 
 	quit         chan struct{}
 	shutdownOnce sync.Once
@@ -106,6 +107,7 @@ func New(cfg *config.Config) (*Server, error) {
 		clients:   make(map[uint64]*connection),
 		quit:      make(chan struct{}),
 		pubsub:    command.NewPubSub(),
+		watchers:  command.NewWatchers(),
 	}
 	var el EffectLog = &discardLog{}
 	s.effects.Store(&el)
@@ -113,6 +115,9 @@ func New(cfg *config.Config) (*Server, error) {
 	// Effects the engine produces on its own -- today only the DEL from a
 	// reaped key -- travel the same path as command effects (FR-3.4).
 	ks.SetEffectSink(effectSink{s})
+	// WATCH is invalidated from the engine, under the shard lock of
+	// whichever goroutine performed the write.
+	ks.SetKeyWatcher(s.watchers)
 
 	// The GC is told the ceiling derived from maxmemory, so that pressure
 	// shows up as slower collection rather than as an OOM kill (ADR-013).
@@ -187,6 +192,9 @@ func (s *Server) IsReplica() bool { return s.isReplica.Load() }
 
 // PubSub returns the subscription registry.
 func (s *Server) PubSub() *command.PubSub { return s.pubsub }
+
+// Watchers returns the WATCH registry.
+func (s *Server) Watchers() *command.Watchers { return s.watchers }
 
 // IsLoading reports whether the dataset is still being read from disk.
 func (s *Server) IsLoading() bool { return s.loading.Load() }

@@ -44,6 +44,8 @@ type Host interface {
 	Follow(host string, port int) error
 	// PubSub returns the server's subscription registry.
 	PubSub() *PubSub
+	// Watchers returns the WATCH registry.
+	Watchers() *Watchers
 	// ReplicasInSync counts the replicas acknowledging recently enough to
 	// satisfy min-replicas-to-write.
 	ReplicasInSync() int

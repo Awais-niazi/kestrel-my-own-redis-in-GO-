@@ -121,6 +121,7 @@ func (s *Server) serveConn(nc net.Conn) {
 		// the registry can never hold a client whose socket has gone.
 		c.stopPusher()
 		s.pubsub.Remove(c.cl)
+		s.watchers.Unwatch(c.cl)
 		s.unregisterConn(c)
 	}()
 

@@ -21,7 +21,7 @@ durability all work.
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
 | M3 | Append log, snapshots, recovery, compaction | done |
 | M4 | Replication | done |
-| M5 | Pub/Sub, transactions, blocking commands | in progress: Pub/Sub done |
+| M5 | Pub/Sub, transactions, blocking commands | in progress: Pub/Sub and transactions done |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
 
@@ -153,6 +153,10 @@ are one operation here, which `docs/deviations.md` explains
 **Pub/Sub** `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH`
 `PUBSUB CHANNELS|NUMSUB|NUMPAT` — each subscriber has a bounded queue and its
 own delivery goroutine, so one slow reader cannot hold up a publisher
+
+**Transactions** `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` — `EXEC` runs
+with no other write interleaved; `docs/deviations.md` records what a
+concurrent reader can still see
 
 **Replication** `REPLICAOF` `SLAVEOF` `REPLCONF` `PSYNC` `WAIT` — a replica
 is fed straight from the leader's log segments, so a partial

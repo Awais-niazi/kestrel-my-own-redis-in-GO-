@@ -69,6 +69,22 @@ type Client struct {
 	// too slow to keep.
 	overflowed atomic.Bool
 
+	// inMulti reports that commands are being queued rather than run.
+	inMulti bool
+	// multiAborted records that something could not be queued, so EXEC must
+	// refuse rather than run a transaction the caller did not ask for.
+	multiAborted bool
+	// queue holds the commands MULTI has collected, detached from the
+	// connection's read buffer.
+	queue [][][]byte
+
+	// watching is the set of keys WATCH registered, touched only under the
+	// Watchers lock.
+	watching map[watchKey]struct{}
+	// watchBroken is set by the engine's key-modification hook, from
+	// whichever goroutine performed the write, and read by EXEC.
+	watchBroken atomic.Bool
+
 	// Replica marks a connection that has been promoted to a replication
 	// link and must no longer be treated as a normal client.
 	Replica bool
@@ -96,6 +112,7 @@ func NewClient(id uint64, addr, localAddr string, out *resp.Writer, db *engine.D
 		channels:      make(map[string]struct{}),
 		patterns:      make(map[string]struct{}),
 		outbox:        make(chan Message, outboxDepth),
+		watching:      make(map[watchKey]struct{}),
 	}
 	c.Touch(time.Now())
 	return c

@@ -984,3 +984,83 @@ whose replies it can still account for.
 RESP3 gives pushes their own type, so the ambiguity does not exist and
 neither does the restriction. Both are one `Kind` in the writer: the
 difference between the dialects is framing, not content.
+
+---
+
+## 18. Transactions: what EXEC excludes, and what it does not
+
+`MULTI` queues; `EXEC` runs the queue with no other write interleaved. That
+exclusion is bought by taking every shard's write-ordering lock for the
+duration -- the same lock the dispatcher takes for one command, held across
+all of them.
+
+It is not the reference implementation's guarantee, which is total: a single
+thread means nothing at all observes a half-finished transaction. **Here a
+concurrent reader can.** Readers do not take the ordering lock, and making
+them take it would put a transaction's cost on every `GET` in the server.
+
+What the weaker guarantee still gives is the part correctness depends on: no
+interleaved write, therefore no lost update, and `WATCH`'s compare-and-set is
+sound. `TestCompareAndSetUnderContention` runs eight clients racing a
+read-modify-write loop and checks the counter equals the number of
+transactions that reported success.
+
+Holding the global barrier instead would have given full isolation and would
+also have deadlocked: handlers take the barrier's read lock through
+`db.lockKey`, and a Go `RWMutex` is not reentrant. That is worth writing down
+because it is the first thing anyone will reach for.
+
+### The watched-key check is inside the lock
+
+Checking whether a watch was broken *before* taking the ordering lock would
+race with exactly the writer the check exists to detect. So `EXEC` takes the
+locks first and checks second.
+
+### A queue error poisons the transaction
+
+A command that cannot be queued -- unknown, wrong arity -- marks the
+transaction dirty and `EXEC` refuses with `EXECABORT`. Skipping it and
+running the rest would be a transaction the caller did not ask for, and the
+missing command would have to be inferred from the reply count.
+
+An error discovered while *running* is different and is reported in its own
+slot, with the remaining commands still run. The two cases are distinguishable
+at queue time, which is why they are treated differently.
+
+### EXEC writes an array header rather than collecting values
+
+Some handlers write their output directly instead of returning a value -- the
+subscribe confirmations do, and so does `EXEC` itself. Collecting a
+transaction's replies into a slice would mean giving those a second way to
+produce a reply, so `EXEC` opens an array with `WriteArrayHeader` and each
+queued command writes into it exactly as it would outside a transaction.
+
+---
+
+## 19. A conformance bug that crashed redis-cli
+
+`COMMAND DOCS` reported a container's children by their bare names -- `get`,
+`set` -- where the reference implementation reports `config|get`,
+`config|set`.
+
+`redis-cli` builds its command hint table from those names and splits each on
+the separator to recover the parent. Given a name with no separator it
+**segfaults**, so any `redis-cli` session that reads commands from a pipe --
+which is how most scripts drive it -- died instantly against Kestrel.
+
+The reply was valid RESP and parsed cleanly. Every test passed. The bug was
+found by piping a few commands to a real `redis-cli` while checking something
+else entirely, and it had been there since M0.
+
+Two things worth taking from it.
+
+**A bare subcommand name is ambiguous anyway.** Several containers have a
+`GET`, so `get` does not identify the command it describes. The correct
+behaviour was also the better one, which is usually the case and is worth
+noticing when it is.
+
+**Protocol conformance is not RESP validity.** Differential testing against
+`redis-server` compares replies, and both servers' replies were well formed;
+what differed was a convention a *client* depends on. Running the real client
+is a different test from comparing the two servers, and it found something
+the other could not.

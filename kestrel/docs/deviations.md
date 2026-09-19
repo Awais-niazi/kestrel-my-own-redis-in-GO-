@@ -198,3 +198,20 @@ overflow and force a full resynchronisation while the records the replica
 wants are still on disk in the AOF. Here, a partial resynchronisation is
 refused only when the segment holding those records has actually been
 unlinked.
+
+## A transaction excludes other writes, but readers can see it part-way
+
+In the reference implementation a single thread means nothing observes a
+half-finished `MULTI`/`EXEC`. Kestrel executes a transaction while holding
+every shard's write-ordering lock, so no other *write* can interleave -- but
+a concurrent reader is not excluded, and may see some of a transaction's
+commands applied and not others.
+
+Making readers take that lock would put a transaction's cost on every `GET`
+in the server, which is the wrong trade for a feature most workloads use
+rarely. What the current guarantee preserves is the part correctness rests
+on: no interleaved write, so no lost update, and `WATCH`'s compare-and-set is
+sound under contention.
+
+`docs/design-notes.md` issue 18 has the reasoning, including why holding the
+global barrier instead would deadlock.

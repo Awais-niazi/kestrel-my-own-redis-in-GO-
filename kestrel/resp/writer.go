@@ -210,6 +210,16 @@ func (w *Writer) bulk(s []byte) {
 	w.crlf()
 }
 
+// WriteArrayHeader opens an array of n elements without writing them.
+//
+// It exists for MULTI/EXEC, where each queued command writes its own reply
+// into the array -- including the handful that write their output directly
+// rather than returning a value. Collecting those into a slice first would
+// mean giving them a second way to produce a reply.
+//
+// The caller must then write exactly n values.
+func (w *Writer) WriteArrayHeader(n int) { w.header('*', n) }
+
 func (w *Writer) header(prefix byte, n int) {
 	w.buf = append(w.buf, prefix)
 	w.buf = strconv.AppendInt(w.buf, int64(n), 10)

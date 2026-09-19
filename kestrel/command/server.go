@@ -1,6 +1,7 @@
 package command
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -210,13 +211,34 @@ func commandDocValue(d *Descriptor) resp.Value {
 		resp.BulkString("group"), resp.BulkString(primaryGroup(d)),
 	}
 	if len(d.Subcommands) > 0 {
+		// A subcommand is named "parent|child", not "child".
+		//
+		// This is not cosmetic. redis-cli builds its hint table from these
+		// names and splits each on the separator to recover the parent; a
+		// bare name gives it nothing to split, and it segfaults. A bare
+		// name is also ambiguous on its own -- several containers have a
+		// GET -- so the full name is the only one that identifies the
+		// command being described.
 		subs := make([]resp.Value, 0, len(d.Subcommands)*2)
-		for name, sub := range d.Subcommands {
-			subs = append(subs, resp.BulkString(strings.ToLower(name)), commandDocValue(sub))
+		for _, sub := range sortedSubcommands(d) {
+			subs = append(subs, resp.BulkString(strings.ToLower(sub.FullName())),
+				commandDocValue(sub))
 		}
 		fields = append(fields, resp.BulkString("subcommands"), resp.Map(subs))
 	}
 	return resp.Map(fields)
+}
+
+// sortedSubcommands returns a container's children in a stable order, so
+// that two COMMAND DOCS replies from the same build are identical and a
+// differential test has something deterministic to compare.
+func sortedSubcommands(d *Descriptor) []*Descriptor {
+	out := make([]*Descriptor, 0, len(d.Subcommands))
+	for _, sub := range d.Subcommands {
+		out = append(out, sub)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 func primaryGroup(d *Descriptor) string {

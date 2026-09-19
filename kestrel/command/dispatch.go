@@ -19,6 +19,17 @@ func Execute(host Host, cl *Client, args [][]byte) {
 	}
 	host.Stats().TotalCommands.Add(1)
 
+	// A client inside MULTI queues almost everything. The commands that
+	// control the transaction itself are the exception, and they are marked
+	// NoMulti rather than listed here, so a new one cannot be added without
+	// deciding which it is.
+	if cl.InMulti() {
+		if d, _ := host.Commands().Lookup(args[0]); d == nil || !d.Is(NoMulti) {
+			cl.Out.WriteValue(queueCommand(host, cl, args))
+			return
+		}
+	}
+
 	d, reply := resolve(host, cl, args)
 	if d == nil {
 		cl.Out.WriteValue(reply)
