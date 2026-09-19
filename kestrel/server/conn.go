@@ -121,6 +121,7 @@ func (s *Server) serveConn(nc net.Conn) {
 		// the registry can never hold a client whose socket has gone.
 		c.stopPusher()
 		s.pubsub.Remove(c.cl)
+		s.monitors.Remove(c.cl)
 		s.watchers.Unwatch(c.cl)
 		s.unregisterConn(c)
 	}()
@@ -243,7 +244,7 @@ func (c *connection) loop() {
 		// it, because this one is about to block in a read. It is started
 		// after the reply has been flushed, so the confirmation cannot be
 		// overtaken by a message about the channel it confirms.
-		if c.pusher == nil && c.cl.Subscribed() {
+		if c.pusher == nil && c.cl.NeedsPusher() {
 			c.startPusher()
 		}
 		if c.cl.Overflowed() {
@@ -363,8 +364,8 @@ func (c *connection) startPusher() {
 				return
 			case <-c.srv.quit:
 				return
-			case m := <-c.cl.Outbox():
-				if err := c.push(m); err != nil {
+			case v := <-c.cl.Outbox():
+				if err := c.push(v); err != nil {
 					return
 				}
 			}
@@ -377,10 +378,10 @@ func (c *connection) startPusher() {
 // Every message is flushed rather than batched. A subscriber is waiting for
 // news, and holding a message back for a buffer that may not fill turns a
 // notification system into a polling one.
-func (c *connection) push(m command.Message) error {
+func (c *connection) push(v resp.Value) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	c.wr.WriteValue(command.MessageValue(m))
+	c.wr.WriteValue(v)
 	return c.wr.Flush()
 }
 
@@ -391,3 +392,36 @@ func (c *connection) stopPusher() {
 		c.pusher = nil
 	}
 }
+
+// ForEachClient calls fn for every connected client.
+//
+// The callback runs while the client table is locked, so it must be quick
+// and must not disconnect anyone: CLIENT KILL collects its victims here and
+// closes them afterwards, because closing inside the walk would mutate the
+// table being iterated.
+func (s *Server) ForEachClient(fn func(*command.Client)) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	for _, c := range s.clients {
+		fn(c.cl)
+	}
+}
+
+// Disconnect closes a client's connection, reporting whether one was found.
+//
+// The socket is closed rather than a flag set. A connection parked in a read
+// or blocked in BLPOP is not going to notice a flag, and CLIENT KILL exists
+// precisely for connections that are not behaving.
+func (s *Server) Disconnect(id uint64) bool {
+	s.clientsMu.Lock()
+	c := s.clients[id]
+	s.clientsMu.Unlock()
+	if c == nil {
+		return false
+	}
+	c.nc.Close()
+	return true
+}
+
+// Monitors returns the set of clients watching the command stream.
+func (s *Server) Monitors() *command.Monitors { return s.monitors }

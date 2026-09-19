@@ -20,6 +20,11 @@ func Execute(host Host, cl *Client, args [][]byte) {
 	}
 	host.Stats().TotalCommands.Add(1)
 
+	// Monitors see the command before it runs, and see it whatever happens
+	// to it: a command that is refused is exactly the kind an operator
+	// turned MONITOR on to find.
+	host.Monitors().Feed(cl, args)
+
 	// A client inside MULTI queues almost everything. The commands that
 	// control the transaction itself are the exception, and they are marked
 	// NoMulti rather than listed here, so a new one cannot be added without

@@ -71,6 +71,7 @@ type Server struct {
 	pubsub   *command.PubSub
 	watchers *command.Watchers
 	blocked  *command.Blocked
+	monitors *command.Monitors
 
 	quit         chan struct{}
 	shutdownOnce sync.Once
@@ -111,6 +112,7 @@ func New(cfg *config.Config) (*Server, error) {
 		pubsub:    command.NewPubSub(),
 		watchers:  command.NewWatchers(),
 		blocked:   command.NewBlocked(),
+		monitors:  command.NewMonitors(),
 	}
 	var el EffectLog = &discardLog{}
 	s.effects.Store(&el)

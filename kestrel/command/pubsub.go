@@ -177,9 +177,15 @@ func (ps *PubSub) Publish(channel string, payload []byte) int {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
+	// The reply is built once and handed to every subscriber. A push
+	// renders differently in RESP2 and RESP3, but that is decided by each
+	// connection's writer from the one Kind, so one value serves all of
+	// them.
+	direct := MessageValue(Message{Channel: channel, Payload: payload})
+
 	n := 0
 	for c := range ps.channels[channel] {
-		if c.deliver(Message{Channel: channel, Payload: payload}) {
+		if c.deliver(direct) {
 			n++
 		}
 	}
@@ -187,8 +193,9 @@ func (ps *PubSub) Publish(channel string, payload []byte) int {
 		if !engine.MatchPattern([]byte(pattern), []byte(channel)) {
 			continue
 		}
+		v := MessageValue(Message{Pattern: pattern, Channel: channel, Payload: payload})
 		for c := range set {
-			if c.deliver(Message{Pattern: pattern, Channel: channel, Payload: payload}) {
+			if c.deliver(v) {
 				n++
 			}
 		}
@@ -233,10 +240,10 @@ func keysOf(m map[string]struct{}) []string {
 	return out
 }
 
-// deliver queues a message, reporting whether it was accepted.
-func (c *Client) deliver(m Message) bool {
+// deliver queues a push, reporting whether it was accepted.
+func (c *Client) deliver(v resp.Value) bool {
 	select {
-	case c.outbox <- m:
+	case c.outbox <- v:
 		return true
 	default:
 		// The queue is full, so this subscriber is not keeping up. It is
@@ -247,8 +254,13 @@ func (c *Client) deliver(m Message) bool {
 	}
 }
 
-// Outbox is the queue a connection's delivery goroutine reads.
-func (c *Client) Outbox() <-chan Message { return c.outbox }
+// Outbox is the queue a connection's delivery goroutine reads. Pub/Sub
+// messages and MONITOR lines both travel on it: from the connection's point
+// of view they are the same thing, output it did not ask for.
+func (c *Client) Outbox() <-chan resp.Value { return c.outbox }
+
+// Push queues a value for delivery, reporting whether it was accepted.
+func (c *Client) Push(v resp.Value) bool { return c.deliver(v) }
 
 // Overflowed reports whether this client fell too far behind to keep.
 func (c *Client) Overflowed() bool { return c.overflowed.Load() }
@@ -452,3 +464,10 @@ func cmdPubSubHelp(c *Ctx) resp.Value {
 	}
 	return resp.ArrayOf(out)
 }
+
+// NeedsPusher reports whether this client is receiving output it did not
+// ask for, and so needs a goroutine to deliver it.
+func (c *Client) NeedsPusher() bool { return c.Subscribed() || c.monitoring.Load() }
+
+// Monitoring reports whether the client is watching the command stream.
+func (c *Client) Monitoring() bool { return c.monitoring.Load() }

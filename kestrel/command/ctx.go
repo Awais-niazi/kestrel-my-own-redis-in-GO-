@@ -48,6 +48,14 @@ type Host interface {
 	Watchers() *Watchers
 	// Blocked returns the registry of clients waiting on keys.
 	Blocked() *Blocked
+	// Monitors returns the set of clients watching the command stream.
+	Monitors() *Monitors
+	// ForEachClient calls fn for every connected client, for CLIENT LIST
+	// and CLIENT KILL.
+	ForEachClient(fn func(*Client))
+	// Disconnect closes a client's connection and reports whether one was
+	// found.
+	Disconnect(id uint64) bool
 	// Quit is closed when the server is shutting down, so a blocked client
 	// is released rather than held until its timeout.
 	Quit() <-chan struct{}

@@ -63,11 +63,13 @@ type Client struct {
 	// subCount mirrors their total so the dispatcher can ask "is this a
 	// subscriber" on every command without taking the registry's lock.
 	subCount atomic.Int64
-	// outbox carries messages to the connection's delivery goroutine.
-	outbox chan Message
+	// outbox carries pushes to the connection's delivery goroutine.
+	outbox chan resp.Value
 	// overflowed records that the outbox filled, which means this client is
 	// too slow to keep.
 	overflowed atomic.Bool
+	// monitoring reports that this client is watching the command stream.
+	monitoring atomic.Bool
 
 	// inMulti reports that commands are being queued rather than run.
 	inMulti bool
@@ -117,7 +119,7 @@ func NewClient(id uint64, addr, localAddr string, out *resp.Writer, db *engine.D
 		User:          "default",
 		channels:      make(map[string]struct{}),
 		patterns:      make(map[string]struct{}),
-		outbox:        make(chan Message, outboxDepth),
+		outbox:        make(chan resp.Value, outboxDepth),
 		watching:      make(map[watchKey]struct{}),
 	}
 	c.Touch(time.Now())

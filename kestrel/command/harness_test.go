@@ -30,6 +30,9 @@ type testHost struct {
 	pubsub      *PubSub
 	watchers    *Watchers
 	blocked     *Blocked
+	monitors    *Monitors
+	clients     []*Client // guarded by mu
+	killed      []uint64  // guarded by mu
 	quit        chan struct{}
 
 	replicasInSync atomic.Int64
@@ -91,7 +94,8 @@ func newTestHost(t *testing.T, tweaks ...func(*config.Config)) *testHost {
 
 	h := &testHost{cfg: cfg, ks: ks, table: table, stats: NewStats(128),
 		start: time.Now(), pubsub: NewPubSub(), watchers: NewWatchers(),
-		blocked: NewBlocked(), quit: make(chan struct{})}
+		blocked: NewBlocked(), monitors: NewMonitors(),
+		quit: make(chan struct{})}
 	h.ApplyRuntimeConfig()
 	h.now.Store(1_700_000_000_000)
 	ks.SetClock(func() int64 { return h.now.Load() })
@@ -132,9 +136,34 @@ func (h *testHost) Snapshot(background bool) error {
 
 func (h *testHost) LastSave() int64 { return h.lastSave.Load() }
 
-func (h *testHost) PubSub() *PubSub       { return h.pubsub }
-func (h *testHost) Watchers() *Watchers   { return h.watchers }
-func (h *testHost) Blocked() *Blocked     { return h.blocked }
+func (h *testHost) PubSub() *PubSub     { return h.pubsub }
+func (h *testHost) Watchers() *Watchers { return h.watchers }
+func (h *testHost) Blocked() *Blocked   { return h.blocked }
+func (h *testHost) Monitors() *Monitors { return h.monitors }
+
+// ForEachClient and Disconnect are backed by a list the tests populate, so
+// CLIENT LIST and CLIENT KILL can be exercised without sockets.
+func (h *testHost) ForEachClient(fn func(*Client)) {
+	h.mu.Lock()
+	clients := append([]*Client(nil), h.clients...)
+	h.mu.Unlock()
+	for _, c := range clients {
+		fn(c)
+	}
+}
+
+func (h *testHost) Disconnect(id uint64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, c := range h.clients {
+		if c.ID == id {
+			h.clients = append(h.clients[:i], h.clients[i+1:]...)
+			h.killed = append(h.killed, id)
+			return true
+		}
+	}
+	return false
+}
 func (h *testHost) Quit() <-chan struct{} { return h.quit }
 
 // ReplicasInSync and WaitReplicas are driven by fields the tests set, so the

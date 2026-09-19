@@ -81,6 +81,13 @@ func init() {
 				Summary: "Returns information about the connection.", Handler: cmdClientInfo},
 			"NO-EVICT": {Arity: 3, Flags: Readonly | Fast | Admin | Loading | Stale,
 				Summary: "Sets the client eviction mode.", Handler: cmdClientNoEvict},
+			"LIST": {Arity: -2, Flags: Readonly | Admin | Loading | Stale,
+				Summary: "Lists the connected clients.", Handler: cmdClientList},
+			"KILL": {Arity: -3, Flags: Readonly | Admin | Loading | Stale,
+				Summary: "Disconnects clients matching a filter.", Handler: cmdClientKill},
+			"NO-TOUCH": {Arity: 3, Flags: Readonly | Fast | Loading | Stale,
+				Summary: "Accepted for compatibility; not implemented.",
+				Handler: cmdClientNoTouch},
 			"HELP": {Arity: 2, Flags: Readonly | Fast | Loading | Stale,
 				Summary: "Shows helpful text.", Handler: cmdClientHelp},
 		},
@@ -256,10 +263,9 @@ func cmdClientSetName(c *Ctx) resp.Value {
 	return resp.OK()
 }
 
-func cmdClientInfo(c *Ctx) resp.Value { return resp.BulkString(clientInfoLine(c)) }
+func cmdClientInfo(c *Ctx) resp.Value { return resp.BulkString(clientInfoLineOf(c.Client)) }
 
-func clientInfoLine(c *Ctx) string {
-	cl := c.Client
+func clientInfoLineOf(cl *Client) string {
 	var b strings.Builder
 	b.Grow(160)
 	writeField(&b, "id", strconv.FormatUint(cl.ID, 10))
@@ -300,6 +306,98 @@ func cmdClientNoEvict(c *Ctx) resp.Value {
 	}
 }
 
+func cmdClientNoTouch(c *Ctx) resp.Value {
+	switch strings.ToUpper(string(c.Arg(2))) {
+	case "ON", "OFF":
+		// The access clock is only maintained under an LRU or LFU policy,
+		// and a client that asks not to touch it is asking for something
+		// that may not be happening at all. Accepting keeps a client that
+		// sets it unconditionally working.
+		return resp.OK()
+	default:
+		return errSyntax
+	}
+}
+
+// cmdClientList renders one line per connection, in the same format as
+// CLIENT INFO.
+func cmdClientList(c *Ctx) resp.Value {
+	filter, reply := parseClientFilter(c, 2, true)
+	if filter == nil {
+		return reply
+	}
+	var b strings.Builder
+	c.Host.ForEachClient(func(cl *Client) {
+		if !filter.matches(cl, c.Client) {
+			return
+		}
+		b.WriteString(clientInfoLineOf(cl))
+		b.WriteByte('\n')
+	})
+	return resp.BulkString(b.String())
+}
+
+// cmdClientKill disconnects clients, by address in the old form or by filter
+// in the new one.
+//
+// The two forms return different things -- +OK or the number killed -- which
+// is a wart of the reference implementation and is reproduced rather than
+// tidied, because tooling written against either form depends on it.
+func cmdClientKill(c *Ctx) resp.Value {
+	if c.Len() == 3 {
+		// Victims are collected before any is closed, here as in the
+		// filter form below. Disconnecting inside the walk would take the
+		// client table's lock while the walk still holds it.
+		addr := string(c.Arg(2))
+		var victims []uint64
+		c.Host.ForEachClient(func(cl *Client) {
+			if cl.Addr == addr {
+				victims = append(victims, cl.ID)
+			}
+		})
+		killed := killClients(c, victims)
+		if killed == 0 {
+			return resp.Err("ERR No such client address in client list")
+		}
+		return resp.OK()
+	}
+
+	filter, reply := parseClientFilter(c, 2, false)
+	if filter == nil {
+		return reply
+	}
+	// The victims are collected before any is closed. Disconnecting inside
+	// the walk would mutate the client table while it is being iterated.
+	var victims []uint64
+	c.Host.ForEachClient(func(cl *Client) {
+		if filter.matches(cl, c.Client) {
+			victims = append(victims, cl.ID)
+		}
+	})
+	return resp.Int(int64(killClients(c, victims)))
+}
+
+// killClients disconnects the given clients and returns how many went.
+//
+// A client that kills itself is closed after its reply rather than during
+// it. Closing the socket immediately loses the answer to the command that
+// asked, so the caller cannot tell whether it worked -- and the count it was
+// waiting for is the only thing CLIENT KILL returns.
+func killClients(c *Ctx, victims []uint64) int {
+	killed := 0
+	for _, id := range victims {
+		if id == c.Client.ID {
+			c.Client.CloseAfterReply = true
+			killed++
+			continue
+		}
+		if c.Host.Disconnect(id) {
+			killed++
+		}
+	}
+	return killed
+}
+
 func cmdClientHelp(c *Ctx) resp.Value {
 	lines := []string{
 		"CLIENT <subcommand>",
@@ -307,7 +405,10 @@ func cmdClientHelp(c *Ctx) resp.Value {
 		"GETNAME               -- Return the current connection name.",
 		"SETNAME <name>        -- Assign the name to the current connection.",
 		"INFO                  -- Return information about the current client.",
+		"LIST [filters]        -- List the connected clients.",
+		"KILL <addr> | [filters] -- Disconnect clients.",
 		"NO-EVICT (ON|OFF)     -- Accepted for compatibility; not implemented.",
+		"NO-TOUCH (ON|OFF)     -- Accepted for compatibility; not implemented.",
 	}
 	out := make([]resp.Value, len(lines))
 	for i, l := range lines {

@@ -23,7 +23,7 @@ durability all work.
 | M3 | Append log, snapshots, recovery, compaction | done |
 | M4 | Replication | done |
 | M5 | Pub/Sub, transactions, blocking commands | done |
-| M6 | `maxmemory`, eviction, full metrics | partial: eviction, accounting, `INFO`, `SLOWLOG`, `/metrics`; `MONITOR` and `CLIENT LIST` remain |
+| M6 | `maxmemory`, eviction, full metrics | done |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
 
 ### What durability means here
@@ -146,7 +146,11 @@ RESP3) `QUIT` `RESET` `CLIENT ID|GETNAME|SETNAME|INFO|NO-EVICT|HELP`
 
 **Server** `INFO` `CONFIG GET|SET|RESETSTAT` `COMMAND` (`COUNT` `INFO` `DOCS`
 `GETKEYS`) `SLOWLOG` `MEMORY USAGE|DOCTOR` `OBJECT` `DEBUG` `TIME` `SHUTDOWN`
-`CLUSTER INFO|MYID|SLOTS|SHARDS`
+`MONITOR` `CLUSTER INFO|MYID|SLOTS|SHARDS`
+
+**Clients** `CLIENT ID|GETNAME|SETNAME|INFO|LIST|KILL|NO-EVICT|NO-TOUCH|HELP`
+— `LIST` and `KILL` share one filter parser, so `LIST` cannot accept a filter
+`KILL` would reject
 
 **Persistence** `SAVE` `BGSAVE` `BGREWRITEAOF` `LASTSAVE` — all three saves
 are one operation here, which `docs/deviations.md` explains

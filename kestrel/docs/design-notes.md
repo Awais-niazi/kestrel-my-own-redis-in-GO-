@@ -1187,3 +1187,57 @@ immediately and then ranks every popular key identically.
 Its leader's `DEL` arrives on the stream. Evicting independently would
 diverge the two, and the replica would be missing keys the leader still
 serves -- the same reasoning as expiry (FR-3.4).
+
+---
+
+## 22. MONITOR and CLIENT KILL
+
+Both were smaller than expected, because the machinery already existed.
+
+### MONITOR reuses the Pub/Sub delivery path
+
+A monitor is a connection receiving output it did not ask for, which is what
+a subscriber is. It goes on the same bounded queue and is delivered by the
+same goroutine, and a monitor that cannot keep up is dropped for the same
+reason a slow subscriber is.
+
+The outbox was generalised from a Pub/Sub message to a rendered `resp.Value`,
+which also removed work: a published message is now built once and handed to
+every subscriber instead of being rebuilt per subscriber. A push renders
+differently in RESP2 and RESP3, but each connection's writer decides that
+from the one `Kind`, so one value serves all of them.
+
+The cost when nobody is watching is one atomic load per command, which is why
+the monitor count is kept apart from the set.
+
+### Passwords are redacted
+
+A monitor stream is a plain-text feed of everything the server does, and
+therefore exactly the wrong place for a password. `AUTH` is redacted from its
+first argument, and so is the `AUTH` clause of `HELLO`, which carries the
+same secret in the same way and which the reference implementation also
+hides.
+
+### Monitors see refused commands
+
+A command that was rejected is exactly what an operator turned `MONITOR` on
+to find, so the feed happens before dispatch decides anything.
+
+### Two bugs in CLIENT KILL, both about lifetime
+
+**Disconnecting inside the walk deadlocks.** `ForEachClient` holds the client
+table's lock; `Disconnect` takes it. The first version called one from inside
+the other, in a function whose own comment warned against exactly that.
+Victims are now collected and closed afterwards.
+
+**Killing yourself must still deliver the reply.** `CLIENT KILL ... SKIPME
+no` includes the caller. Closing its socket immediately loses the answer to
+the command that asked, so the caller cannot tell whether it worked -- and
+the count is the only thing `CLIENT KILL` returns. A self-kill now sets
+`CloseAfterReply`, so the reply goes out and the connection closes after it.
+
+### The socket is closed, not a flag set
+
+A connection parked in a read, or blocked in `BLPOP`, will not notice a flag.
+`CLIENT KILL` exists precisely for connections that are not behaving, so it
+closes the socket and lets the connection's own goroutine discover it.
