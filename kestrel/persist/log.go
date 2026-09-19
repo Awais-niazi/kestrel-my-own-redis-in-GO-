@@ -201,6 +201,36 @@ func (l *segment) Append(db int, args [][]byte) (uint64, error) {
 	return at, nil
 }
 
+// AppendRaw writes an already-framed record.
+//
+// The frame is checked before it is written rather than trusted. These bytes
+// arrived over a network from another process, and a log that accepts a
+// record it cannot itself read back is one that fails at recovery, long
+// after whatever produced it has gone.
+func (l *segment) AppendRaw(raw []byte) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return 0, l.err
+	}
+	if err := verifyRecord(raw); err != nil {
+		return 0, err
+	}
+	at := l.offset
+	if _, err := l.f.Write(raw); err != nil {
+		return 0, l.fail(err)
+	}
+	l.offset += uint64(len(raw))
+	l.dirty = true
+	l.writes.Add(1)
+	if Fsync(l.fsync.Load()) == FsyncAlways {
+		if err := l.syncLocked(); err != nil {
+			return 0, err
+		}
+	}
+	return at, nil
+}
+
 // Offset is the stream offset just past the last record written. A snapshot
 // anchors each shard to the value this returns at the instant the shard is
 // serialized.

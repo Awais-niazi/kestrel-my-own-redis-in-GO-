@@ -38,14 +38,15 @@ where the repository came from.
 
 ## Status
 
-M0 (skeleton), M1 (core key/value), M2 (collections) and M3 (persistence)
-are complete: 149 working commands, strings, lists, hashes, sets and sorted sets with adaptive
+M0 (skeleton), M1 (core key/value), M2 (collections), M3 (persistence) and
+M4 (replication) are complete: 154 working commands, strings, lists, hashes, sets and sorted sets with adaptive
 encodings, expiration, `SCAN`, RESP2 and RESP3, TLS, and a metrics endpoint.
 
-M4 (replication) is in progress: a replica follows a leader over a socket,
-resynchronises fully or partially, and is fed straight from the leader's log
-segments rather than from a separate backlog. `WAIT` and replica-side
-persistence are still to come.
+M4 (replication) is complete: a replica follows a leader over a socket, is
+fed straight from the leader's log segments rather than a separate backlog,
+and persists what it applies at the leader's own offsets — so a restarted
+replica resumes with no transfer at all. `WAIT` and `min-replicas-to-write`
+work.
 
 M3 (persistence) is complete: **a restart keeps your data.** With
 `appendonly yes` the server logs the canonical effect of every write and

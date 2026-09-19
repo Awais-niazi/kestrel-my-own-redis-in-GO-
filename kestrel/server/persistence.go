@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +17,14 @@ import (
 
 // snapshotFileName is the snapshot inside the data directory. The append log
 // is a set of segment files that persist names and discovers for itself.
-const snapshotFileName = "kestrel.snapshot"
+const (
+	snapshotFileName = "kestrel.snapshot"
+	// leaderFileName records which replication history the local files
+	// belong to. Without it a restarted replica knows its offset but not
+	// whose numbering it is in, and an offset without a history is worse
+	// than none: quoted to the wrong leader it names a different write.
+	leaderFileName = "kestrel.leader"
+)
 
 // persistence owns the append log and drives startup recovery.
 //
@@ -25,8 +33,9 @@ const snapshotFileName = "kestrel.snapshot"
 // acknowledged until its effect has reached the log, subject to the
 // appendfsync policy.
 type persistence struct {
-	dir      string
-	snapPath string
+	dir        string
+	snapPath   string
+	leaderPath string
 
 	log *persist.Log
 
@@ -45,6 +54,15 @@ type persistence struct {
 	// triggers compare against.
 	changesAtSave atomic.Int64
 	sizeAtSave    atomic.Int64
+
+	// snapshotLast is the end of the window the on-disk snapshot's anchors
+	// span. Local state is only usable once the log has reached it: before
+	// that the shards hold different instants and no single offset
+	// describes them. See Server.restore.
+	snapshotLast atomic.Uint64
+	// leaderID is the replication history the on-disk state belongs to,
+	// when it came from a leader.
+	leaderID atomic.Pointer[string]
 }
 
 // openPersistence prepares the data directory and returns the subsystem, or
@@ -60,11 +78,30 @@ func (s *Server) openPersistence(snap *config.Values) (*persistence, error) {
 		return nil, fmt.Errorf("creating %s: %w", snap.Dir, err)
 	}
 	p := &persistence{
-		dir:      snap.Dir,
-		snapPath: filepath.Join(snap.Dir, snapshotFileName),
+		dir:        snap.Dir,
+		snapPath:   filepath.Join(snap.Dir, snapshotFileName),
+		leaderPath: filepath.Join(snap.Dir, leaderFileName),
 	}
 	p.lastSave.Store(time.Now().Unix())
+	if b, err := os.ReadFile(p.leaderPath); err == nil {
+		id := strings.TrimSpace(string(b))
+		p.leaderID.Store(&id)
+	}
 	return p, nil
+}
+
+// setLeaderID records, or clears, which replication history the files in the
+// data directory belong to.
+func (p *persistence) setLeaderID(id string) error {
+	if id == "" {
+		p.leaderID.Store(nil)
+		if err := os.Remove(p.leaderPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	p.leaderID.Store(&id)
+	return writeFileSynced(p.leaderPath, []byte(id))
 }
 
 // restore rebuilds the keyspace from whatever is on disk and leaves the log
@@ -86,12 +123,12 @@ func (s *Server) restore(p *persistence, snap *config.Values) error {
 	defer s.ks.SetLoading(false)
 
 	start := time.Now()
-	var from uint64
+	var from, snapshotLast uint64
 	var anchors persist.Anchors
 
 	switch load, err := persist.LoadSnapshot(p.snapPath, command.NewReplayer(s)); {
 	case err == nil:
-		from, anchors = load.First, load.Anchors
+		from, anchors, snapshotLast = load.First, load.Anchors, load.Last
 		s.log.Info("loaded snapshot", "path", p.snapPath, "records", load.Records,
 			"shards", len(load.Anchors), "window_first", load.First,
 			"window_last", load.Last)
@@ -126,6 +163,30 @@ func (s *Server) restore(p *persistence, snap *config.Values) error {
 	if err := p.openLog(snap); err != nil {
 		return err
 	}
+
+	// A snapshot's shards were taken at different instants, so the state it
+	// describes is only complete once the log has reached the end of the
+	// window its anchors span. Below that point different shards hold
+	// different moments and no single offset describes them -- which is
+	// exactly what a replica that crashed part-way through a transfer has.
+	if snapshotLast > 0 && p.log.Offset() < snapshotLast {
+		if snap.ReplicaOf == "" {
+			return fmt.Errorf("the snapshot in %s covers the log up to offset %d "+
+				"but the log ends at %d: the records in between are in no file, "+
+				"so the dataset cannot be rebuilt",
+				p.dir, snapshotLast, p.log.Offset())
+		}
+		s.log.Warn("local state is incomplete and cannot be trusted; "+
+			"resynchronising from the leader",
+			"snapshot_covers_to", snapshotLast, "log_ends_at", p.log.Offset())
+		s.ks.FlushAll()
+		if err := p.log.Reset(0); err != nil {
+			return err
+		}
+		p.setLeaderID("")
+		snapshotLast = 0
+	}
+	p.snapshotLast.Store(snapshotLast)
 	s.log.Info("recovery complete",
 		"keys", s.ks.TotalKeys(), "log_records", res.Records,
 		"log_records_skipped", res.Skipped, "log_segments", res.Segments,
@@ -268,6 +329,7 @@ func (p *persistence) Snapshot(s *Server) (SnapshotOutcome, error) {
 	out.SegmentsRemoved, out.BytesFreed = removed, freed
 
 	p.lastSave.Store(time.Now().Unix())
+	p.snapshotLast.Store(info.Last)
 	p.changesAtSave.Store(s.ks.Stats().Changes)
 	p.sizeAtSave.Store(p.log.Stats().Size)
 	out.Elapsed = time.Since(started)

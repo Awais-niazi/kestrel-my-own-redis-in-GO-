@@ -338,6 +338,47 @@ func (l *Log) Prune(below uint64) (removed int, freed int64, err error) {
 	return removed, freed, err
 }
 
+// AppendRaw writes a record that was framed elsewhere, which is how a
+// replica persists what its leader sent.
+//
+// The bytes are written unchanged, so the replica's log is byte-identical to
+// the leader's over the range they share, and its offsets are the leader's
+// offsets. That is what lets a restarted replica quote a position its leader
+// recognises without any translation.
+func (l *Log) AppendRaw(raw []byte) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	at, err := l.cur.AppendRaw(raw)
+	if err == nil {
+		l.wakeLocked()
+	}
+	return at, err
+}
+
+// Reset discards every segment and starts again at base.
+//
+// A replica does this when its leader hands it a snapshot: the records it
+// holds belong to a history it is being told to abandon, and keeping them
+// would leave offsets that mean something else. Nothing else should call it.
+func (l *Log) Reset(base uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err := l.cur.Close(); err != nil {
+		return err
+	}
+	for _, s := range l.segs {
+		if err := os.Remove(s.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	l.segs = l.segs[:0]
+	if err := l.startSegmentLocked(1, base); err != nil {
+		return err
+	}
+	return syncDir(l.dir)
+}
+
 // Segments returns the segments the log currently spans.
 func (l *Log) Segments() []Segment {
 	l.mu.Lock()

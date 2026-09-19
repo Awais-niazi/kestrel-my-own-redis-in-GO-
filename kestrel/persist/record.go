@@ -248,3 +248,22 @@ func readLine(p []byte) (int, []byte, error) {
 	}
 	return 0, nil, fmt.Errorf("%w: unterminated length", ErrCorrupt)
 }
+
+// verifyRecord checks a framed record that did not come from this process.
+func verifyRecord(raw []byte) error {
+	if len(raw) < recordHeaderSize {
+		return fmt.Errorf("%w: record is %d bytes, shorter than a header",
+			ErrCorrupt, len(raw))
+	}
+	size := int(binary.LittleEndian.Uint32(raw[0:]))
+	if size < 0 || size > MaxRecordSize || recordHeaderSize+size != len(raw) {
+		return fmt.Errorf("%w: record header claims %d payload bytes but %d were given",
+			ErrCorrupt, size, len(raw)-recordHeaderSize)
+	}
+	want := binary.LittleEndian.Uint32(raw[8:])
+	got := crc32.Update(crc32.Checksum(raw[:8], crcTable), crcTable, raw[recordHeaderSize:])
+	if got != want {
+		return fmt.Errorf("%w: checksum mismatch on an incoming record", ErrCorrupt)
+	}
+	return nil
+}

@@ -843,3 +843,83 @@ Not from the last byte written. A leader with nothing to send would otherwise
 watch every healthy replica fall out of sync the moment the write rate
 dropped to zero, and start refusing writes precisely because there were none
 -- which is both wrong and the hardest kind of outage to diagnose.
+
+---
+
+## 16. When a replica's own files can be trusted
+
+A replica now writes the records its leader sends into its own log, unchanged
+and at the leader's offsets. So its log is byte-identical to the leader's
+over the range they share, and a restarted replica can quote a position its
+leader recognises with no translation at all.
+
+### The invariant
+
+Local state is usable only when **`log.Offset() >= snapshot.Last`**.
+
+A snapshot's shards are serialized at different instants, so the state it
+describes is complete only once the log has reached the end of the window its
+anchors span. Below that point different shards hold different moments and no
+single offset describes any of them -- which is exactly what a replica that
+crashed part-way through a transfer has on disk.
+
+The check runs at startup on every node, not only replicas:
+
+- **A replica** with incomplete state warns, discards it, and
+  resynchronises. It has somewhere to get the truth from.
+- **A leader** refuses to start. It does not, and coming up with a hole in
+  the dataset while reporting success is the worst outcome available.
+
+A snapshot whose window is a single point -- `First` equal to `Last`, which
+is what a snapshot of a quiet server produces -- is self-contained, and the
+check can never fire for it. That is correct, and it is why the test for this
+has to load the server while it snapshots: a quiet snapshot has nothing to be
+short of.
+
+### Switching histories is ordered so no crash leaves a lie
+
+On a full resynchronisation the replica: writes the incoming snapshot to a
+temporary file and forces it; loads it, so a snapshot that cannot be read
+never replaces one that can; **resets the log**; renames the snapshot into
+place; records the leader's replication id.
+
+The log is discarded *before* the snapshot is renamed. A crash between the
+two leaves the old snapshot with no log, which the invariant reads as
+unusable and resynchronises. The other order would leave a new snapshot
+beside a log from the old history, whose offsets mean something else
+entirely -- and nothing about the files would say so.
+
+### The replica applies with the dispatcher's locking discipline
+
+The replica's applier does not go through `Execute`, so it was taking neither
+the write-ordering lock nor the cross-shard guard. On a replica that persists
+and snapshots, both are needed, for exactly the reasons they are needed on a
+leader:
+
+- Its snapshots anchor each shard to a log offset, and that anchor is exact
+  only if no write to the shard is between having been applied and having
+  been logged. Doing the two in either order without a lock across both
+  makes the anchor wrong in one direction or the other -- the shard missing
+  a record the anchor says it has, or holding one the anchor says it does
+  not -- and recovery then loses a write or applies it twice.
+- A cross-shard effect must stay out of a snapshot window, and a replica
+  takes its own snapshots, so it needs its own exclusion.
+
+So `Replayer.ApplyStreamed` takes the same locks `Execute` does. It was
+tempting to reason that a single applier goroutine cannot race with itself;
+that is true and irrelevant, because the thing it races with is the
+snapshotter.
+
+### An offset without a history is worse than no offset
+
+A restarted replica reads its offset from its log, but an offset is only
+meaningful in one leader's numbering: quoted to a different leader it names a
+different write. So the replication id is written to `kestrel.leader` beside
+the snapshot, and a replica offers a position only when it knows whose it is.
+
+This also caught a bug worth recording. The first version read the resume
+offset from the in-memory counter when the leader answered `+CONTINUE`. On a
+reconnect that is right; on a *restart* the counter is zero while the offset
+actually asked for came from disk, so the replica silently restarted the
+stream numbering from zero and never caught up. The fix is to resume at the
+offset that was asked for, which is the only one both ends agreed on.

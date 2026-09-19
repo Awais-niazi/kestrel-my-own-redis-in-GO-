@@ -31,6 +31,26 @@ type Replayer struct {
 	// Filter.
 	anchorOf func(db, shard int) uint64
 	split    [][]byte // reused when a record has to be applied to some keys only
+
+	// persist, when set, writes the record to this node's own log while the
+	// write's ordering locks are held. See ApplyStreamed.
+	persist func(raw []byte) error
+}
+
+// Persist makes the Replayer write each record to this node's log, inside
+// the same locks that cover the keyspace change.
+//
+// A replica that persists what it applies needs exactly the discipline the
+// dispatcher uses on a leader, and for the same reason. Its own snapshots
+// anchor each shard to a log offset, and that anchor is only exact if no
+// write to the shard is between having been applied and having been logged.
+// Doing the two in either order without a lock across both makes the anchor
+// wrong: one way the shard is missing a record the anchor says it has, the
+// other way it holds one the anchor says it does not, and recovery then
+// loses a write or applies it twice.
+func (r *Replayer) Persist(fn func(raw []byte) error) *Replayer {
+	r.persist = fn
+	return r
 }
 
 // NewReplayer returns a Replayer that writes into host's keyspace.
@@ -74,23 +94,9 @@ func (r *Replayer) Apply(db int, offset uint64, args [][]byte) error {
 	if len(args) == 0 {
 		return fmt.Errorf("replay: empty record")
 	}
-	d, ok := r.table.Lookup(args[0])
-	if !ok {
-		return fmt.Errorf("replay: unknown command %q", args[0])
-	}
-	if len(d.Subcommands) > 0 && len(args) >= 2 {
-		if sub, ok := r.table.LookupSub(d, args[1]); ok {
-			d = sub
-		}
-	}
-	if !d.Is(Write) {
-		// Only writes are propagated, so a read in the log means the file
-		// was not written by this system, or was written by a version whose
-		// command table disagrees with this one.
-		return fmt.Errorf("replay: %s is not a write command", d.FullName())
-	}
-	if !arityOK(d, len(args)) {
-		return fmt.Errorf("replay: %s got %d arguments", d.FullName(), len(args))
+	d, err := r.resolve(args)
+	if err != nil {
+		return err
 	}
 	if !r.cl.Select(r.host.Keyspace(), db) {
 		return fmt.Errorf("replay: no database %d", db)
@@ -104,6 +110,72 @@ func (r *Replayer) Apply(db int, offset uint64, args [][]byte) error {
 		args = apply
 	}
 	return r.run(d, args)
+}
+
+// ApplyStreamed applies a replicated record and persists it, holding the
+// write's ordering locks across both.
+//
+// raw is the record exactly as it was framed by the node that produced it.
+// It is written unchanged, so this node's log is byte-identical to that one
+// over the range they share.
+func (r *Replayer) ApplyStreamed(db int, offset uint64, args [][]byte, raw []byte) error {
+	if r.persist == nil {
+		return r.Apply(db, offset, args)
+	}
+	d, err := r.resolve(args)
+	if err != nil {
+		return err
+	}
+
+	ks := r.host.Keyspace()
+	var order engine.WriteOrder
+	if d.Locality == LocalityCrossShard {
+		// The guard keeps this effect out of a snapshot window, exactly as
+		// it does on a leader. A replica takes its own snapshots, so it
+		// needs its own exclusion.
+		ks.BeginCrossShard()
+		defer ks.EndCrossShard()
+		order = ks.OrderAllWrites()
+	} else {
+		edb := ks.DB(db)
+		if edb == nil {
+			return fmt.Errorf("replay: no database %d", db)
+		}
+		order = edb.OrderWrites(ExtractKeys(d, args))
+	}
+	defer order.Done()
+
+	if err := r.Apply(db, offset, args); err != nil {
+		return err
+	}
+	return r.persist(raw)
+}
+
+// resolve finds the descriptor for a record and rejects anything that is not
+// a write this table knows.
+func (r *Replayer) resolve(args [][]byte) (*Descriptor, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("replay: empty record")
+	}
+	d, ok := r.table.Lookup(args[0])
+	if !ok {
+		return nil, fmt.Errorf("replay: unknown command %q", args[0])
+	}
+	if len(d.Subcommands) > 0 && len(args) >= 2 {
+		if sub, ok := r.table.LookupSub(d, args[1]); ok {
+			d = sub
+		}
+	}
+	if !d.Is(Write) {
+		// Only writes are propagated, so a read in the log means the file
+		// was not written by this system, or was written by a version whose
+		// command table disagrees with this one.
+		return nil, fmt.Errorf("replay: %s is not a write command", d.FullName())
+	}
+	if !arityOK(d, len(args)) {
+		return nil, fmt.Errorf("replay: %s got %d arguments", d.FullName(), len(args))
+	}
+	return d, nil
 }
 
 func (r *Replayer) run(d *Descriptor, args [][]byte) error {

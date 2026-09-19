@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,11 +170,16 @@ func (s *Server) replicaSession(ctx context.Context, st *replicaState) error {
 	// An offset is only offered when this process has already applied part
 	// of this leader's stream. Without persistence there is nothing to
 	// resume from across a restart, so the first attempt is always full.
-	id, off := "?", "0"
+	// A persisted replica can resume across a restart, not only across a
+	// dropped link, because its log holds the leader's own records at the
+	// leader's own offsets.
+	id, asked := "?", uint64(0)
 	if prev, ok := st.lastReplID(); ok {
-		id, off = prev, strconv.FormatUint(st.offset.Load(), 10)
+		id, asked = prev, st.offset.Load()
+	} else if prev, at, ok := s.persistedPosition(); ok {
+		id, asked = prev, at
 	}
-	if err := writeCommand(nc, "PSYNC", id, off); err != nil {
+	if err := writeCommand(nc, "PSYNC", id, strconv.FormatUint(asked, 10)); err != nil {
 		return err
 	}
 	head, err := readLine(br)
@@ -187,7 +191,11 @@ func (s *Server) replicaSession(ctx context.Context, st *replicaState) error {
 	var anchors persist.Anchors
 	switch {
 	case strings.HasPrefix(head, "+CONTINUE"):
-		from = st.offset.Load()
+		// The stream resumes at the offset that was asked for, which on a
+		// restart came from the log on disk rather than from this process's
+		// memory. Reading it back from the in-memory counter would give
+		// zero and silently restart the numbering.
+		from = asked
 		s.log.Info("resumed replication", "offset", from)
 	case strings.HasPrefix(head, "+FULLRESYNC"):
 		from, anchors, err = s.fullResync(st, head, br)
@@ -207,6 +215,7 @@ func (s *Server) replicaSession(ctx context.Context, st *replicaState) error {
 
 // fullResync receives a snapshot and loads it, replacing everything.
 func (s *Server) fullResync(st *replicaState, head string, br *bufio.Reader) (uint64, persist.Anchors, error) {
+	p := s.persist
 	f := strings.Fields(head)
 	if len(f) != 3 {
 		return 0, nil, fmt.Errorf("malformed FULLRESYNC: %q", head)
@@ -225,11 +234,10 @@ func (s *Server) fullResync(st *replicaState, head string, br *bufio.Reader) (ui
 	// parsed from memory, so that the loader is the same code a restart
 	// runs. A second implementation of it would be a second place for the
 	// two to disagree.
-	tmp := filepath.Join(s.persist.dir, "kestrel.incoming-snapshot")
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+	tmp := p.snapPath + ".incoming"
+	if err := writeFileSynced(tmp, body); err != nil {
 		return 0, nil, err
 	}
-	defer os.Remove(tmp)
 
 	s.ks.SetLoading(true)
 	defer s.ks.SetLoading(false)
@@ -239,8 +247,29 @@ func (s *Server) fullResync(st *replicaState, head string, br *bufio.Reader) (ui
 
 	load, err := persist.LoadSnapshot(tmp, command.NewReplayer(s))
 	if err != nil {
+		os.Remove(tmp)
 		return 0, nil, fmt.Errorf("loading the leader's snapshot: %w", err)
 	}
+
+	// The local files are switched to the new history only once the
+	// snapshot has been shown to load, so a snapshot that cannot be read
+	// never replaces one that can.
+	//
+	// The log is discarded before the snapshot is renamed into place. A
+	// crash between the two leaves the old snapshot with no log, which the
+	// startup check reads as unusable and resynchronises -- whereas the
+	// other order would leave a new snapshot beside a log from the old
+	// history, whose offsets mean something else entirely.
+	if err := p.log.Reset(load.First); err != nil {
+		return 0, nil, fmt.Errorf("resetting the log for a new history: %w", err)
+	}
+	if err := os.Rename(tmp, p.snapPath); err != nil {
+		return 0, nil, err
+	}
+	if err := p.setLeaderID(f[1]); err != nil {
+		return 0, nil, err
+	}
+	p.snapshotLast.Store(load.Last)
 	st.fullSync.Add(1)
 	s.log.Info("full resynchronisation complete", "records", load.Records,
 		"shards", len(load.Anchors), "from_offset", load.First,
@@ -256,7 +285,10 @@ func (s *Server) fullResync(st *replicaState, head string, br *bufio.Reader) (ui
 func (s *Server) applyStream(ctx context.Context, st *replicaState, nc net.Conn,
 	br *bufio.Reader, from uint64, anchors persist.Anchors) error {
 
-	replayer := command.NewReplayer(s)
+	replayer := command.NewReplayer(s).Persist(func(raw []byte) error {
+		_, err := s.persist.log.AppendRaw(raw)
+		return err
+	})
 	if anchors != nil {
 		// Each shard of the shipped snapshot was taken at a different
 		// instant, so early records belong to some shards and not others.
@@ -268,6 +300,7 @@ func (s *Server) applyStream(ctx context.Context, st *replicaState, nc net.Conn,
 	}
 
 	stream := persist.NewRecordStream(br, from)
+	stream.KeepRaw(true)
 
 	// Acknowledgements are sent whenever the replica catches up, and on a
 	// timer as a fallback for a link that is idle.
@@ -311,7 +344,7 @@ func (s *Server) applyStream(ctx context.Context, st *replicaState, nc net.Conn,
 		if rec.Kind != persist.KindEffect {
 			return fmt.Errorf("the leader sent a %d record on the stream", rec.Kind)
 		}
-		if err := replayer.Apply(rec.DB, rec.Offset, rec.Args); err != nil {
+		if err := replayer.ApplyStreamed(rec.DB, rec.Offset, rec.Args, rec.Raw); err != nil {
 			// A record that does not apply means the two keyspaces have
 			// already diverged. Carrying on would widen the gap silently.
 			return fmt.Errorf("applying the leader's stream: %w", err)
@@ -421,4 +454,36 @@ func (s *Server) stopReplication() {
 		st.cancel()
 		<-st.done
 	}
+}
+
+// writeFileSynced writes a file and forces it, so that a rename onto it
+// cannot publish a name whose contents are still in flight.
+func writeFileSynced(path string, body []byte) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(body); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// persistedPosition reports the replication history and offset this node
+// holds on disk, when its local state is complete enough to resume from.
+func (s *Server) persistedPosition() (string, uint64, bool) {
+	p := s.persist
+	if p == nil || p.log == nil {
+		return "", 0, false
+	}
+	id := p.leaderID.Load()
+	if id == nil || *id == "" {
+		return "", 0, false
+	}
+	return *id, p.log.Offset(), true
 }

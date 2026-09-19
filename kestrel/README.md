@@ -9,8 +9,8 @@ distribution and is not affiliated with Redis Ltd.
 
 ## Status
 
-**M0 (skeleton), M1 (core key/value), M2 (collections) and M3 (persistence)
-are complete.** The server runs, real Redis clients talk to it, and strings,
+**M0 (skeleton), M1 (core key/value), M2 (collections), M3 (persistence) and
+M4 (replication) are complete.** The server runs, real Redis clients talk to it, and strings,
 lists, hashes, sets, sorted sets, generic keyspace commands, expiration and
 durability all work.
 
@@ -20,7 +20,7 @@ durability all work.
 | M1 | Strings, generic keyspace, expiration, `SCAN`, `SELECT`, multiple databases | done |
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
 | M3 | Append log, snapshots, recovery, compaction | done |
-| M4 | Replication | in progress: links, `WAIT` and `min-replicas-to-write` done; replica persistence remains |
+| M4 | Replication | done |
 | M5 | Pub/Sub, transactions, blocking commands | not started |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
@@ -152,7 +152,9 @@ are one operation here, which `docs/deviations.md` explains
 
 **Replication** `REPLICAOF` `SLAVEOF` `REPLCONF` `PSYNC` `WAIT` — a replica
 is fed straight from the leader's log segments, so a partial
-resynchronisation is a seek and there is no separate backlog to size
+resynchronisation is a seek and there is no separate backlog to size. A
+replica persists what it applies at the leader's own offsets, so a restarted
+replica resumes without a transfer
 
 **Operations** protected mode, `requirepass`, TLS and mutual TLS,
 `rename-command`, structured JSON logs, graceful shutdown, a separate admin
