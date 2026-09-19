@@ -199,9 +199,11 @@ func cmdExec(c *Ctx) resp.Value {
 	}
 
 	cl.Out.WriteArrayHeader(len(queued))
+	cl.inExec = true
 	for _, args := range queued {
 		runQueued(c.Host, cl, args)
 	}
+	cl.inExec = false
 	order.Done()
 
 	c.Host.Watchers().Unwatch(cl)

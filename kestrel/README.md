@@ -9,8 +9,9 @@ distribution and is not affiliated with Redis Ltd.
 
 ## Status
 
-**M0 (skeleton), M1 (core key/value), M2 (collections), M3 (persistence) and
-M4 (replication) are complete.** The server runs, real Redis clients talk to it, and strings,
+**M0 (skeleton), M1 (core key/value), M2 (collections), M3 (persistence),
+M4 (replication) and M5 (Pub/Sub, transactions, blocking commands) are
+complete.** The server runs, real Redis clients talk to it, and strings,
 lists, hashes, sets, sorted sets, generic keyspace commands, expiration and
 durability all work.
 
@@ -21,7 +22,7 @@ durability all work.
 | M2 | Lists, hashes, sets, sorted sets, adaptive encodings | done |
 | M3 | Append log, snapshots, recovery, compaction | done |
 | M4 | Replication | done |
-| M5 | Pub/Sub, transactions, blocking commands | in progress: Pub/Sub and transactions done |
+| M5 | Pub/Sub, transactions, blocking commands | done |
 | M6 | `maxmemory`, eviction, full metrics | partial: accounting, `INFO`, `SLOWLOG`, `/metrics` |
 | M7 | RESP3, TLS, ACL, hardening | partial: RESP3 and TLS done, ACL not started |
 
@@ -153,6 +154,10 @@ are one operation here, which `docs/deviations.md` explains
 **Pub/Sub** `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH`
 `PUBSUB CHANNELS|NUMSUB|NUMPAT` — each subscriber has a bounded queue and its
 own delivery goroutine, so one slow reader cannot hold up a publisher
+
+**Blocking** `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` `BZPOPMIN` `BZPOPMAX` — a
+blocked client simply waits on its own goroutine, so a blocking command is
+the non-blocking one in a retry loop
 
 **Transactions** `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` — `EXEC` runs
 with no other write interleaved; `docs/deviations.md` records what a

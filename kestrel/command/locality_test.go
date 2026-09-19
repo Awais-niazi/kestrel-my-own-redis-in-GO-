@@ -63,6 +63,8 @@ func TestWriteCommandsDeclareLocality(t *testing.T) {
 // flush to some shards and not others. Excluding them keeps the filter
 // working on whole commands.
 var crossShardCommands = []string{
+	"BLMOVE",
+	"BRPOPLPUSH",
 	"COPY",
 	"FLUSHALL",
 	"FLUSHDB",

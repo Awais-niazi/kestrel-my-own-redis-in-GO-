@@ -29,6 +29,8 @@ type testHost struct {
 	isReplica   bool
 	pubsub      *PubSub
 	watchers    *Watchers
+	blocked     *Blocked
+	quit        chan struct{}
 
 	replicasInSync atomic.Int64
 	replicasAcked  atomic.Int64
@@ -88,12 +90,13 @@ func newTestHost(t *testing.T, tweaks ...func(*config.Config)) *testHost {
 	t.Cleanup(ks.Close)
 
 	h := &testHost{cfg: cfg, ks: ks, table: table, stats: NewStats(128),
-		start: time.Now(), pubsub: NewPubSub(), watchers: NewWatchers()}
+		start: time.Now(), pubsub: NewPubSub(), watchers: NewWatchers(),
+		blocked: NewBlocked(), quit: make(chan struct{})}
 	h.ApplyRuntimeConfig()
 	h.now.Store(1_700_000_000_000)
 	ks.SetClock(func() int64 { return h.now.Load() })
 	ks.SetEffectSink(hostSink{h})
-	ks.SetKeyWatcher(h.watchers)
+	ks.SetKeyWatcher(bothWatchers{h.watchers, h.blocked})
 	return h
 }
 
@@ -129,8 +132,10 @@ func (h *testHost) Snapshot(background bool) error {
 
 func (h *testHost) LastSave() int64 { return h.lastSave.Load() }
 
-func (h *testHost) PubSub() *PubSub     { return h.pubsub }
-func (h *testHost) Watchers() *Watchers { return h.watchers }
+func (h *testHost) PubSub() *PubSub       { return h.pubsub }
+func (h *testHost) Watchers() *Watchers   { return h.watchers }
+func (h *testHost) Blocked() *Blocked     { return h.blocked }
+func (h *testHost) Quit() <-chan struct{} { return h.quit }
 
 // ReplicasInSync and WaitReplicas are driven by fields the tests set, so the
 // command behaviour can be exercised without a second server.
@@ -280,5 +285,14 @@ func (s *session) expectErrPrefix(prefix string, args ...string) {
 	if !v.IsError() || !strings.HasPrefix(string(v.Str), prefix) {
 		s.t.Errorf("%s = %q, want an error starting with %q",
 			strings.Join(args, " "), str(v), prefix)
+	}
+}
+
+// bothWatchers mirrors the server's fan-out of the engine's key hook.
+type bothWatchers [2]engine.KeyWatcher
+
+func (b bothWatchers) KeyModified(db int, key []byte) {
+	for _, w := range b {
+		w.KeyModified(db, key)
 	}
 }

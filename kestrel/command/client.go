@@ -85,6 +85,12 @@ type Client struct {
 	// whichever goroutine performed the write, and read by EXEC.
 	watchBroken atomic.Bool
 
+	// inExec reports that a queued command is being run by EXEC, which is
+	// how a blocking command knows not to block: nothing can write while
+	// the transaction holds the write locks, so waiting would be a deadlock
+	// the caller could not break.
+	inExec bool
+
 	// Replica marks a connection that has been promoted to a replication
 	// link and must no longer be treated as a normal client.
 	Replica bool

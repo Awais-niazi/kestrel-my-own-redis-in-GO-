@@ -215,3 +215,23 @@ sound under contention.
 
 `docs/design-notes.md` issue 18 has the reasoning, including why holding the
 global barrier instead would deadlock.
+
+## Blocked clients are not served in arrival order
+
+The reference implementation wakes the longest-waiting client first when a
+key gains a value. Kestrel wakes every client blocked on that key and they
+race to retry, so which one is served is down to the Go scheduler.
+
+Each element still goes to exactly one client, which is the property a work
+queue depends on. What is not guaranteed is that a client which has waited
+longer is served first, so a workload that needs fairness between consumers
+should not rely on it.
+
+Strict ordering would need a handoff queue per key rather than a wake-up
+broadcast. It is a contained change if it turns out to matter.
+
+## `LMPOP`, `ZMPOP`, `BLMPOP` and `BZMPOP` are not implemented
+
+The multi-key pop family added in Redis 7 is out of scope for this version,
+along with its blocking variants. `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`,
+`BZPOPMIN` and `BZPOPMAX` cover the same ground for one key at a time.

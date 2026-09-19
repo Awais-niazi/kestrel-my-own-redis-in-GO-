@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"kestrel/config"
+	"kestrel/engine"
 	"kestrel/resp"
 )
 
@@ -62,20 +63,55 @@ func Execute(host Host, cl *Client, args [][]byte) {
 	// The cross-shard guard keeps an effect that reads one key and writes
 	// another out of a snapshot window, where the per-shard recovery filter
 	// could not replay it safely. See Keyspace.SnapshotWindow.
+	var locks writeLocks
 	if d.Locality == LocalityCrossShard {
-		ks.BeginCrossShard()
-		order := ks.OrderAllWrites()
-		result := runAndPropagate(host, cl, ctx, d, args, cfg)
-		order.Done()
-		ks.EndCrossShard()
-		cl.Out.WriteValue(result)
+		locks = writeLocks{ks: ks, cross: true}
+	} else {
+		locks = writeLocks{ks: ks, db: cl.DBIndex, keys: ExtractKeys(d, args)}
+	}
+	locks.acquire()
+	// A blocking command gives the locks back while it waits, through
+	// Ctx.Yield, and takes them again before it returns.
+	ctx.locks = &locks
+	result := runAndPropagate(host, cl, ctx, d, args, cfg)
+	locks.release()
+	cl.Out.WriteValue(result)
+}
+
+// writeLocks is the pair of locks a write holds across its execution and the
+// propagation of its effect.
+//
+// It is a value rather than two lines of dispatch because a blocking command
+// has to release and retake exactly the same set, and getting that set wrong
+// in one of the two places would be a deadlock or a silent ordering bug.
+type writeLocks struct {
+	ks    *engine.Keyspace
+	db    int
+	keys  [][]byte
+	cross bool
+	order engine.WriteOrder
+	held  bool
+}
+
+func (w *writeLocks) acquire() {
+	if w.cross {
+		w.ks.BeginCrossShard()
+		w.order = w.ks.OrderAllWrites()
+	} else {
+		w.order = w.ks.DB(w.db).OrderWrites(w.keys)
+	}
+	w.held = true
+}
+
+func (w *writeLocks) release() {
+	if !w.held {
 		return
 	}
-
-	order := ks.DB(cl.DBIndex).OrderWrites(ExtractKeys(d, args))
-	result := runAndPropagate(host, cl, ctx, d, args, cfg)
-	order.Done()
-	cl.Out.WriteValue(result)
+	w.order.Done()
+	if w.cross {
+		w.ks.EndCrossShard()
+	}
+	w.held = false
 }
 
 // runAndPropagate executes the handler, records its cost and hands its

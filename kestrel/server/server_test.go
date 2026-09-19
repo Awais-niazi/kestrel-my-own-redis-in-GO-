@@ -113,6 +113,9 @@ type conn struct {
 	nc net.Conn
 	rr *resp.ReplyReader
 	bw *bufio.Writer
+	// wait is how long a reply may take. Blocking commands are expected to
+	// exceed the default, so their tests raise it.
+	wait time.Duration
 }
 
 func (ts *testServer) connect(t *testing.T) *conn {
@@ -122,7 +125,8 @@ func (ts *testServer) connect(t *testing.T) *conn {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { nc.Close() })
-	return &conn{t: t, nc: nc, rr: resp.NewReplyReader(nc), bw: bufio.NewWriter(nc)}
+	return &conn{t: t, nc: nc, rr: resp.NewReplyReader(nc), bw: bufio.NewWriter(nc),
+		wait: 5 * time.Second}
 }
 
 func (c *conn) send(args ...string) {
@@ -143,7 +147,7 @@ func (c *conn) sendRaw(s string) {
 
 func (c *conn) reply() resp.Value {
 	c.t.Helper()
-	c.nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	c.nc.SetReadDeadline(time.Now().Add(c.wait))
 	v, err := c.rr.ReadReply()
 	if err != nil {
 		c.t.Fatalf("reading reply: %v", err)

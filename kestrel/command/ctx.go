@@ -46,6 +46,11 @@ type Host interface {
 	PubSub() *PubSub
 	// Watchers returns the WATCH registry.
 	Watchers() *Watchers
+	// Blocked returns the registry of clients waiting on keys.
+	Blocked() *Blocked
+	// Quit is closed when the server is shutting down, so a blocked client
+	// is released rather than held until its timeout.
+	Quit() <-chan struct{}
 	// ReplicasInSync counts the replicas acknowledging recently enough to
 	// satisfy min-replicas-to-write.
 	ReplicasInSync() int
@@ -74,6 +79,11 @@ type Ctx struct {
 	// it at zero is not propagated, which is how SETNX-on-an-existing-key
 	// avoids reaching the log.
 	dirty int
+
+	// locks are the write-ordering locks the dispatcher is holding for this
+	// command, so that a blocking handler can give them back while it
+	// waits. See Yield.
+	locks *writeLocks
 
 	// effects holds explicit replacement effects set by a Rewrite. When it
 	// is nil and dirty is non-zero, the command propagates verbatim.
@@ -153,4 +163,25 @@ func bulkOrNil(v []byte, ok bool) resp.Value {
 		return resp.Null()
 	}
 	return resp.Bulk(v)
+}
+
+// Yield releases the write-ordering locks, runs wait, and takes them again.
+//
+// A blocking command must not hold them while it waits, because the write it
+// is waiting for needs the same locks to happen. Holding them is a deadlock
+// that looks exactly like a client that has stopped responding: BLPOP on a
+// key blocks every RPUSH to that key, including the one that would have
+// woken it.
+//
+// The locks are retaken before the handler returns, so the attempt that
+// finally succeeds mutates and propagates under them, exactly as a
+// non-blocking write does.
+func (c *Ctx) Yield(wait func()) {
+	if c.locks == nil {
+		wait()
+		return
+	}
+	c.locks.release()
+	wait()
+	c.locks.acquire()
 }

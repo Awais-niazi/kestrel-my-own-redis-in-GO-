@@ -69,6 +69,7 @@ type Server struct {
 
 	pubsub   *command.PubSub
 	watchers *command.Watchers
+	blocked  *command.Blocked
 
 	quit         chan struct{}
 	shutdownOnce sync.Once
@@ -108,6 +109,7 @@ func New(cfg *config.Config) (*Server, error) {
 		quit:      make(chan struct{}),
 		pubsub:    command.NewPubSub(),
 		watchers:  command.NewWatchers(),
+		blocked:   command.NewBlocked(),
 	}
 	var el EffectLog = &discardLog{}
 	s.effects.Store(&el)
@@ -115,9 +117,10 @@ func New(cfg *config.Config) (*Server, error) {
 	// Effects the engine produces on its own -- today only the DEL from a
 	// reaped key -- travel the same path as command effects (FR-3.4).
 	ks.SetEffectSink(effectSink{s})
-	// WATCH is invalidated from the engine, under the shard lock of
-	// whichever goroutine performed the write.
-	ks.SetKeyWatcher(s.watchers)
+	// Both WATCH and the blocking commands learn about writes from the same
+	// hook, which the engine calls under the shard lock of whichever
+	// goroutine performed the write.
+	ks.SetKeyWatcher(keyWatchers{s.watchers, s.blocked})
 
 	// The GC is told the ceiling derived from maxmemory, so that pressure
 	// shows up as slower collection rather than as an OOM kill (ADR-013).
@@ -195,6 +198,23 @@ func (s *Server) PubSub() *command.PubSub { return s.pubsub }
 
 // Watchers returns the WATCH registry.
 func (s *Server) Watchers() *command.Watchers { return s.watchers }
+
+// Blocked returns the registry of clients waiting on keys.
+func (s *Server) Blocked() *command.Blocked { return s.blocked }
+
+// Quit is closed when the server begins shutting down.
+func (s *Server) Quit() <-chan struct{} { return s.quit }
+
+// keyWatchers fans the engine's single key-modification hook out to
+// everything that needs it. It is called under a shard lock, so each
+// listener does no more than a map lookup.
+type keyWatchers []engine.KeyWatcher
+
+func (k keyWatchers) KeyModified(db int, key []byte) {
+	for _, w := range k {
+		w.KeyModified(db, key)
+	}
+}
 
 // IsLoading reports whether the dataset is still being read from disk.
 func (s *Server) IsLoading() bool { return s.loading.Load() }

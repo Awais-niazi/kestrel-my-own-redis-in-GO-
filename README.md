@@ -39,8 +39,11 @@ where the repository came from.
 ## Status
 
 M0 (skeleton), M1 (core key/value), M2 (collections), M3 (persistence) and
-M4 (replication) are complete: 154 working commands, strings, lists, hashes, sets and sorted sets with adaptive
+M4 (replication) and M5 (Pub/Sub, transactions, blocking commands) are
+complete: 171 working commands, strings, lists, hashes, sets and sorted sets with adaptive
 encodings, expiration, `SCAN`, RESP2 and RESP3, TLS, and a metrics endpoint.
+
+M5 (Pub/Sub, transactions and blocking commands) is complete.
 
 M4 (replication) is complete: a replica follows a leader over a socket, is
 fed straight from the leader's log segments rather than a separate backlog,

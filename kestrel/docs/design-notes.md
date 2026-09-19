@@ -1064,3 +1064,66 @@ noticing when it is.
 what differed was a convention a *client* depends on. Running the real client
 is a different test from comparing the two servers, and it found something
 the other could not.
+
+---
+
+## 20. Blocking commands, and the lock a blocked client must not hold
+
+A blocked client here simply waits. The reference implementation cannot: one
+thread serves everyone, so it parks the client, records the keys it wants,
+and revisits them after every command. A connection here already has a
+goroutine, and letting it wait costs a goroutine that was going to sit in a
+read anyway.
+
+That makes a blocking command the non-blocking one in a loop: try, register
+interest, **try again**, wait. The second attempt is what makes it correct.
+Without it, a value arriving between the first attempt and the registration
+is missed, and the client waits for a push that has already happened.
+
+### The deadlock this chunk was really about
+
+The first version deadlocked, and the failure looked exactly like a client
+that had stopped responding: `BLPOP queue 0` blocked every `RPUSH queue` in
+the server -- **including the one that would have woken it.**
+
+The dispatcher holds the write-ordering lock across a write's execution and
+the propagation of its effect (issue 10). A blocking command is a write, so
+it was holding the lock for its keys while it waited, and the write it was
+waiting for needed that same lock.
+
+The fix is `Ctx.Yield`: the handler gives the locks back, waits, and takes
+them again before returning. So the attempt that finally succeeds mutates
+and propagates under them, exactly as a non-blocking write does, and the
+attempts that fail hold nothing.
+
+It is worth noticing what found this. The unit tests passed; the failure
+appeared the moment a test used two connections, because with one connection
+there is nobody to be deadlocked against.
+
+### Blocking commands propagate their non-blocking form
+
+`BLPOP` logs `LPOP`, `BLMOVE` logs `LMOVE`. Propagating the command as
+written would make a replica block on its own replication stream, waiting for
+a push that will only arrive as a later record it is not reading yet. ADR-008's
+rule -- a command that cannot be replayed verbatim must declare a canonical
+rewrite -- is what forces the question to be answered.
+
+### Inside MULTI they do not block
+
+Nothing can write while a transaction holds the write locks, so waiting would
+be a deadlock the caller could not break. A queued blocking command returns
+its empty result instead, which is what the reference implementation does.
+
+They are queued like any other command: marking them `NoMulti` -- which the
+first version did -- made them run immediately instead, in the middle of a
+transaction being built.
+
+### Fairness is not guaranteed
+
+The reference implementation serves the longest-waiting client first. Here
+several blocked goroutines are woken together and race to retry, so which one
+wins is whichever the scheduler runs first. Each element still goes to
+exactly one client, which is what makes a work queue work, and
+`TestOnlyOneWaiterGetsEachElement` pins that. Strict FIFO would need a
+handoff queue per key and is not worth it until someone needs it; the
+deviation is recorded.

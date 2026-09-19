@@ -122,3 +122,6 @@ func errSubscriberMode(name string) resp.Value {
 		"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are " +
 		"allowed in this context")
 }
+
+// errTimeout refuses a blocking command whose timeout argument is unusable.
+var errTimeout = resp.Err("ERR timeout is not a float or out of range")
