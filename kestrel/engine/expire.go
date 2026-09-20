@@ -118,7 +118,7 @@ const (
 func (db *DB) PTTL(key []byte) int64 {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o := db.lookup(s, key)
+	o := db.peek(s, key)
 	if o == nil {
 		return int64(TTLNoKey)
 	}
@@ -136,7 +136,7 @@ func (db *DB) PTTL(key []byte) int64 {
 func (db *DB) ExpireTime(key []byte) int64 {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o := db.lookup(s, key)
+	o := db.peek(s, key)
 	if o == nil {
 		return int64(TTLNoKey)
 	}

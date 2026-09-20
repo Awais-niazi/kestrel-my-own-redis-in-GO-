@@ -551,28 +551,78 @@ func (db *DB) unlockAll() {
 	db.ks.barrier.RUnlock()
 }
 
-// lookup returns the live object for key, reaping it first if it has expired.
-// The shard must be locked.
-func (db *DB) lookup(s *shard, key []byte) *Object {
+// The keyspace is reached through two families of accessor, and which one a
+// method uses is a statement about whether it is allowed to write to the
+// effect stream.
+//
+// peek is the read family. A read holds the shard's mu but not its prop
+// (engine/order.go), so it has no ordered position in the stream and must
+// not append to it. An expired key is therefore hidden -- exactly as it is
+// on a replica -- and the deletion, with the DEL that records it, is left to
+// the active expiry cycle, which does hold prop.
+//
+// lookup is the write family. Its callers are reached through
+// DB.OrderWrites, so prop is held, the reap is ordered against every other
+// write to the shard, and the DEL it emits lands in the log at the position
+// it actually happened.
+//
+// The split matters because replay disables expiry (Keyspace.SetLoading):
+// nothing in the log expires while the log is being applied. A write that
+// observed an expired key and did not say so would be replayed against the
+// key it thought was gone -- LPUSH would extend the stale list rather than
+// start a new one. Reads have nothing to say, so they may stay silent; every
+// write must speak. See docs/design-notes.md issue 10.
+
+// Access tells a method that serves both a read-only and a writing command
+// which of the two it is being called as.
+//
+// Nearly every method is one or the other and says so by which accessor
+// family it uses. A few are shared: SORT and SORT_RO run the same handler
+// over the same key, and so do SUNION and SUNIONSTORE. Only one of each pair
+// holds the write-ordering lock, and the difference is invisible from inside
+// the engine, so the caller states it.
+type Access bool
+
+const (
+	// ReadAccess hides an expired key. The caller holds no propagation lock
+	// and must not emit an effect.
+	ReadAccess Access = false
+	// WriteAccess reaps an expired key and propagates the DEL. The caller
+	// reached the engine through DB.OrderWrites.
+	WriteAccess Access = true
+)
+
+// get is peek or lookup, chosen by the caller's declared access.
+func (db *DB) get(s *shard, key []byte, a Access) *Object {
+	if a == WriteAccess {
+		return db.lookup(s, key)
+	}
+	return db.peekRead(s, key)
+}
+
+// getType is get with a type assertion.
+func (db *DB) getType(s *shard, key []byte, t ObjectType, a Access) (*Object, error) {
+	return typed(db.get(s, key, a), t)
+}
+
+// peek returns the live object for key, hiding an expired one without
+// reaping it. The shard must be locked.
+func (db *DB) peek(s *shard, key []byte) *Object {
 	o := s.dict[string(key)] // the compiler elides the string allocation here
 	if o == nil {
 		return nil
 	}
 	db.ks.touchAccess(o)
 	if db.ks.expired(o) {
-		if db.ks.IsReplica() {
-			// Hide it, but let the leader's DEL do the deleting (FR-3.4).
-			return nil
-		}
-		db.expireKey(s, string(key), o)
 		return nil
 	}
 	return o
 }
 
-// lookupRead is lookup plus hit/miss accounting.
-func (db *DB) lookupRead(s *shard, key []byte) *Object {
-	o := db.lookup(s, key)
+// peekRead is peek plus hit/miss accounting. Only reads keep these counters,
+// which is what INFO's keyspace_hits and keyspace_misses mean.
+func (db *DB) peekRead(s *shard, key []byte) *Object {
+	o := db.peek(s, key)
 	if o == nil {
 		s.misses++
 	} else {
@@ -581,9 +631,67 @@ func (db *DB) lookupRead(s *shard, key []byte) *Object {
 	return o
 }
 
-// lookupType is lookupRead with a type assertion.
+// peekType is peekRead with a type assertion.
+func (db *DB) peekType(s *shard, key []byte, t ObjectType) (*Object, error) {
+	return typed(db.peekRead(s, key), t)
+}
+
+// lookup returns the live object for key, reaping it first if it has expired.
+// The shard must be locked and its propagation lock held.
+func (db *DB) lookup(s *shard, key []byte) *Object {
+	o := s.dict[string(key)]
+	if o == nil {
+		return nil
+	}
+	db.ks.touchAccess(o)
+	if !db.ks.expired(o) {
+		return o
+	}
+	if !db.ks.IsReplica() {
+		// A replica hides an expired key but leaves the deleting to the
+		// leader's DEL (FR-3.4); a leader reaps it here and says so.
+		db.expireKey(s, string(key), o)
+	}
+	return nil
+}
+
+// lookupType is lookup with a type assertion.
 func (db *DB) lookupType(s *shard, key []byte, t ObjectType) (*Object, error) {
-	o := db.lookupRead(s, key)
+	return typed(db.lookup(s, key), t)
+}
+
+// assertWriteOrdering makes the keyspace check that effects are emitted by a
+// caller that holds the shard's propagation lock. See
+// SetWriteOrderingAssertions.
+var assertWriteOrdering atomic.Bool
+
+// SetWriteOrderingAssertions turns on an internal check that every effect the
+// keyspace emits on its own behalf is emitted in write order.
+//
+// It is for tests. The mistake it catches is a read path that reaps an
+// expired key, which produces a log that replays to a different keyspace --
+// a difference that surfaces at the next restart rather than at the call, so
+// it is worth paying an uncontended TryLock per reap to have a test name the
+// caller instead. It is off by default and nothing in production reads it.
+func SetWriteOrderingAssertions(on bool) { assertWriteOrdering.Store(on) }
+
+// assertOrdered panics when the shard's propagation lock is demonstrably not
+// held. A successful TryLock proves no one holds it; a failed one proves
+// only that someone does, which under concurrency need not be this
+// goroutine. The check is therefore one-directional by construction: it has
+// no false positives, and it misses a violation that happens to race with an
+// unrelated writer.
+func (db *DB) assertOrdered(s *shard) {
+	if !assertWriteOrdering.Load() {
+		return
+	}
+	if s.prop.TryLock() {
+		s.prop.Unlock()
+		panic("engine: effect emitted without the shard's propagation lock")
+	}
+}
+
+func typed(o *Object, t ObjectType) (*Object, error) {
 	if o == nil {
 		return nil, nil
 	}
@@ -594,8 +702,12 @@ func (db *DB) lookupType(s *shard, key []byte, t ObjectType) (*Object, error) {
 }
 
 // expireKey deletes an expired key and propagates the deletion. The shard
-// must be locked.
+// must be locked and its propagation lock held: the DEL emitted here takes a
+// position in the effect stream, and a position that is not ordered against
+// concurrent writes is a log that replays to a different keyspace than the
+// one that produced it.
 func (db *DB) expireKey(s *shard, key string, o *Object) {
+	db.assertOrdered(s)
 	db.removeLocked(s, key, o)
 	s.expiredKeys++
 	db.ks.emit(db.Index, delCommand, []byte(key))

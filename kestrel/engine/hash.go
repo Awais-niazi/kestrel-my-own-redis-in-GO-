@@ -231,7 +231,14 @@ func (h *Hash) RandomFields(count int, withValues bool, rng *rand.Rand) [][]byte
 
 // hashAt returns the hash stored at key, or nil when absent.
 func (db *DB) hashAt(s *shard, key []byte) (*Object, *Hash, error) {
-	o, err := db.collectionAt(s, key, TypeHash)
+	return asHash(db.collectionAt(s, key, TypeHash))
+}
+
+func (db *DB) hashRead(s *shard, key []byte) (*Object, *Hash, error) {
+	return asHash(db.collectionRead(s, key, TypeHash))
+}
+
+func asHash(o *Object, err error) (*Object, *Hash, error) {
 	if err != nil || o == nil {
 		return nil, nil, err
 	}
@@ -287,7 +294,7 @@ func (db *DB) HSetNX(key, field, value []byte) (bool, error) {
 func (db *DB) HGet(key, field []byte) ([]byte, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return nil, false, err
 	}
@@ -300,7 +307,7 @@ func (db *DB) HMGet(key []byte, fields [][]byte) ([][]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
 	out := make([][]byte, len(fields))
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return out, err
 	}
@@ -337,7 +344,7 @@ func (db *DB) HDel(key []byte, fields [][]byte) (int64, error) {
 func (db *DB) HLen(key []byte) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return 0, err
 	}
@@ -348,7 +355,7 @@ func (db *DB) HLen(key []byte) (int64, error) {
 func (db *DB) HExists(key, field []byte) (bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return false, err
 	}
@@ -359,7 +366,7 @@ func (db *DB) HExists(key, field []byte) (bool, error) {
 func (db *DB) HStrLen(key, field []byte) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return 0, err
 	}
@@ -381,7 +388,7 @@ const (
 func (db *DB) HRead(key []byte, part HashPart) ([][]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return nil, err
 	}
@@ -461,7 +468,7 @@ func (db *DB) HIncrByFloat(key, field []byte, delta float64) (float64, []byte, e
 func (db *DB) HRandField(key []byte, count int, withValues bool) ([][]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, h, err := db.hashAt(s, key)
+	_, h, err := db.hashRead(s, key)
 	if err != nil || h == nil {
 		return nil, err
 	}

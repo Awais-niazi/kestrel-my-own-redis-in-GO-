@@ -28,7 +28,7 @@ type SetResult struct {
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o, err := db.lookupType(s, key, TypeString)
+	o, err := db.peekType(s, key, TypeString)
 	if err != nil || o == nil {
 		return nil, false, err
 	}
@@ -113,7 +113,7 @@ func (db *DB) GetEx(key []byte, at int64, persist bool) ([]byte, bool, error) {
 func (db *DB) StrLen(key []byte) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o, err := db.lookupType(s, key, TypeString)
+	o, err := db.peekType(s, key, TypeString)
 	if err != nil || o == nil {
 		return 0, err
 	}
@@ -157,7 +157,7 @@ func (db *DB) Append(key, val []byte) (int64, error) {
 func (db *DB) GetRange(key []byte, start, end int64) ([]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o, err := db.lookupType(s, key, TypeString)
+	o, err := db.peekType(s, key, TypeString)
 	if err != nil || o == nil {
 		return nil, err
 	}
@@ -275,7 +275,7 @@ func (db *DB) MGet(keys [][]byte) [][]byte {
 
 	out := make([][]byte, len(keys))
 	for i, k := range keys {
-		o := db.lookupRead(db.shardFor(k), k)
+		o := db.peekRead(db.shardFor(k), k)
 		if o != nil && o.Type == TypeString {
 			out[i] = o.stringBytes()
 		}

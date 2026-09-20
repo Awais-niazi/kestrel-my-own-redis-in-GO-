@@ -253,3 +253,29 @@ that matters, since a silently dropped restriction is a permission granted.
 
 There is no `aclfile`. Users are defined at runtime with `ACL SETUSER`, and
 `requirepass` continues to configure the default user.
+
+## A read never deletes an expired key
+
+The reference implementation expires lazily on access: a read that finds a
+key past its TTL deletes it there and then, and propagates the `DEL`.
+
+Kestrel's reads *hide* an expired key — they report it as absent, exactly as
+a replica does — and leave the deletion and its `DEL` to the active expiry
+cycle. The observable answer to any command is the same. What differs is
+when the memory comes back and when the `DEL` reaches the log and the
+replicas: on the next active pass rather than on the read.
+
+The reason is ordering. An effect's position in the log has to match the
+order the mutation happened in, and that is enforced by a per-shard lock the
+command layer takes around every write. Reads do not take it, because taking
+it would put every `GET` behind a concurrent write's log append. A read that
+emitted a `DEL` would therefore be writing into the stream from outside the
+order it defines, and a log whose records are out of order replays to a
+different dataset than the one that produced it. See design-notes.md issue 26.
+
+**What this means.** With the active cycle turned off (`active-expire no`),
+expired keys are still hidden correctly, but nothing ever frees them: the
+setting leaks memory rather than serving stale data. `DBSIZE`, `KEYS`,
+`SCAN`, `RANDOMKEY` and `INFO keyspace` all exclude expired keys whether or
+not they have been reaped, so the leak is invisible except in
+`used_memory` — which is where it should be visible.

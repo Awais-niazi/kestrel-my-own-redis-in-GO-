@@ -76,7 +76,13 @@ func cmdSort(c *Ctx) resp.Value {
 		}
 	}
 
-	elements, ok, err := c.DB().SortSource(c.Arg(1))
+	// SORT replays from its own arguments, so it is a write and reaps an
+	// expired source; SORT_RO holds no write-ordering lock and only hides one.
+	access := engine.WriteAccess
+	if readOnly {
+		access = engine.ReadAccess
+	}
+	elements, ok, err := c.DB().SortSource(c.Arg(1), access)
 	if err != nil {
 		return engineError(err)
 	}

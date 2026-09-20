@@ -274,7 +274,14 @@ func (s *Set) RandomMembers(count int, rng *rand.Rand) [][]byte {
 // ---------------------------------------------------------------- database
 
 func (db *DB) setAt(s *shard, key []byte) (*Object, *Set, error) {
-	o, err := db.collectionAt(s, key, TypeSet)
+	return asSet(db.collectionAt(s, key, TypeSet))
+}
+
+func (db *DB) setRead(s *shard, key []byte) (*Object, *Set, error) {
+	return asSet(db.collectionRead(s, key, TypeSet))
+}
+
+func asSet(o *Object, err error) (*Object, *Set, error) {
 	if err != nil || o == nil {
 		return nil, nil, err
 	}
@@ -333,7 +340,7 @@ func (db *DB) SRem(key []byte, members [][]byte) (int64, error) {
 func (db *DB) SCard(key []byte) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, set, err := db.setAt(s, key)
+	_, set, err := db.setRead(s, key)
 	if err != nil || set == nil {
 		return 0, err
 	}
@@ -344,7 +351,7 @@ func (db *DB) SCard(key []byte) (int64, error) {
 func (db *DB) SIsMember(key, member []byte) (bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, set, err := db.setAt(s, key)
+	_, set, err := db.setRead(s, key)
 	if err != nil || set == nil {
 		return false, err
 	}
@@ -356,7 +363,7 @@ func (db *DB) SMIsMember(key []byte, members [][]byte) ([]bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
 	out := make([]bool, len(members))
-	_, set, err := db.setAt(s, key)
+	_, set, err := db.setRead(s, key)
 	if err != nil || set == nil {
 		return out, err
 	}
@@ -370,7 +377,7 @@ func (db *DB) SMIsMember(key []byte, members [][]byte) ([]bool, error) {
 func (db *DB) SMembers(key []byte) ([][]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, set, err := db.setAt(s, key)
+	_, set, err := db.setRead(s, key)
 	if err != nil || set == nil {
 		return nil, err
 	}
@@ -381,7 +388,7 @@ func (db *DB) SMembers(key []byte) ([][]byte, error) {
 func (db *DB) SRandMember(key []byte, count int) ([][]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, set, err := db.setAt(s, key)
+	_, set, err := db.setRead(s, key)
 	if err != nil || set == nil {
 		return nil, err
 	}
@@ -461,14 +468,16 @@ const (
 func (db *DB) SetCombine(op SetOp, keys [][]byte, limit int) ([][]byte, error) {
 	locked := db.lockKeys(keys)
 	defer db.unlockShards(locked)
-	return db.combineLocked(op, keys, limit)
+	return db.combineLocked(op, keys, limit, ReadAccess)
 }
 
-// combineLocked requires the shards of keys to be held.
-func (db *DB) combineLocked(op SetOp, keys [][]byte, limit int) ([][]byte, error) {
+// combineLocked requires the shards of keys to be held. a is the access of
+// the command being served: SUNION and friends only read their sources,
+// SUNIONSTORE and friends replay verbatim and so must reap them.
+func (db *DB) combineLocked(op SetOp, keys [][]byte, limit int, a Access) ([][]byte, error) {
 	sets := make([]*Set, len(keys))
 	for i, k := range keys {
-		o, err := db.lookupType(db.shardFor(k), k, TypeSet)
+		o, err := db.getType(db.shardFor(k), k, TypeSet, a)
 		if err != nil {
 			return nil, err
 		}
@@ -556,7 +565,7 @@ func (db *DB) SetCombineStore(op SetOp, dst []byte, keys [][]byte) (int64, error
 	locked := db.lockKeys(all)
 	defer db.unlockShards(locked)
 
-	members, err := db.combineLocked(op, keys, 0)
+	members, err := db.combineLocked(op, keys, 0, WriteAccess)
 	if err != nil {
 		return 0, err
 	}

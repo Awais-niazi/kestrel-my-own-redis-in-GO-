@@ -215,16 +215,43 @@ func TestRandomChoiceEffectsArePinned(t *testing.T) {
 	}
 }
 
-func TestLazyExpiryPropagatesDelete(t *testing.T) {
+// A read hides an expired key and says nothing; the DEL that records the
+// death comes from the active cycle, which holds the write-ordering lock.
+// See docs/design-notes.md issue 10.
+func TestExpiryIsReportedByTheActiveCycleNotByAReader(t *testing.T) {
 	h := newTestHost(t)
 	s := newSession(t, h)
 	s.do("SET", "k", "v", "PX", "50")
 	h.takeEffects()
 	h.advance(51)
-	s.do("GET", "k")
+
+	if got := str(s.do("GET", "k")); got != "<nil>" {
+		t.Fatalf("GET served an expired key: %q", got)
+	}
+	if got := h.takeEffects(); len(got) != 0 {
+		t.Fatalf("a read appended to the effect stream: %v", got)
+	}
+
+	h.ks.ExpirePass(farFuture())
+	if got := h.takeEffects(); len(got) != 1 || got[0].String() != "DEL k" {
+		t.Fatalf("active expiry produced %v, want [DEL k]", got)
+	}
+}
+
+// A write reaps instead of hiding, because a verbatim effect is replayed
+// against whatever the key holds and replay does not expire anything.
+func TestAWriteOnAnExpiredKeyPropagatesTheDeleteFirst(t *testing.T) {
+	h := newTestHost(t)
+	s := newSession(t, h)
+	s.do("RPUSH", "l", "a")
+	s.do("PEXPIRE", "l", "50")
+	h.takeEffects()
+	h.advance(51)
+
+	s.do("RPUSH", "l", "b")
 	got := h.takeEffects()
-	if len(got) != 1 || got[0].String() != "DEL k" {
-		t.Fatalf("lazy expiry produced %v, want [DEL k]", got)
+	if len(got) != 2 || got[0].String() != "DEL l" || got[1].String() != "RPUSH l b" {
+		t.Fatalf("the write produced %v, want [DEL l, RPUSH l b]", got)
 	}
 }
 

@@ -418,7 +418,14 @@ const (
 )
 
 func (db *DB) zsetAt(s *shard, key []byte) (*Object, *ZSet, error) {
-	o, err := db.collectionAt(s, key, TypeZSet)
+	return asZSet(db.collectionAt(s, key, TypeZSet))
+}
+
+func (db *DB) zsetRead(s *shard, key []byte) (*Object, *ZSet, error) {
+	return asZSet(db.collectionRead(s, key, TypeZSet))
+}
+
+func asZSet(o *Object, err error) (*Object, *ZSet, error) {
 	if err != nil || o == nil {
 		return nil, nil, err
 	}
@@ -517,7 +524,7 @@ func (db *DB) ZRem(key []byte, members [][]byte) (int64, error) {
 func (db *DB) ZScore(key, member []byte) (float64, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return 0, false, err
 	}
@@ -530,7 +537,7 @@ func (db *DB) ZMScore(key []byte, members [][]byte) ([]float64, []bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
 	scores, found := make([]float64, len(members)), make([]bool, len(members))
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return scores, found, err
 	}
@@ -544,7 +551,7 @@ func (db *DB) ZMScore(key []byte, members [][]byte) ([]float64, []bool, error) {
 func (db *DB) ZCard(key []byte) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return 0, err
 	}
@@ -555,7 +562,7 @@ func (db *DB) ZCard(key []byte) (int64, error) {
 func (db *DB) ZRank(key, member []byte, reverse bool) (int, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return 0, false, err
 	}
@@ -567,7 +574,7 @@ func (db *DB) ZRank(key, member []byte, reverse bool) (int, bool, error) {
 func (db *DB) ZCount(key []byte, r ScoreRange) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return 0, err
 	}
@@ -578,7 +585,7 @@ func (db *DB) ZCount(key []byte, r ScoreRange) (int64, error) {
 func (db *DB) ZLexCount(key []byte, r LexRange) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return 0, err
 	}
@@ -611,7 +618,7 @@ type ZRangeSpec struct {
 func (db *DB) ZRange(key []byte, spec ZRangeSpec) ([]ZMember, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return nil, err
 	}
@@ -703,7 +710,7 @@ func (db *DB) ZRemRange(key []byte, spec ZRangeSpec) (int64, error) {
 func (db *DB) ZRandMember(key []byte, count int) ([]ZMember, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, z, err := db.zsetAt(s, key)
+	_, z, err := db.zsetRead(s, key)
 	if err != nil || z == nil {
 		return nil, err
 	}
@@ -727,13 +734,16 @@ const (
 func (db *DB) ZCombine(op SetOp, keys [][]byte, weights []float64, agg Aggregate, limit int) ([]ZMember, error) {
 	locked := db.lockKeys(keys)
 	defer db.unlockShards(locked)
-	return db.zcombineLocked(op, keys, weights, agg, limit)
+	return db.zcombineLocked(op, keys, weights, agg, limit, ReadAccess)
 }
 
-func (db *DB) zcombineLocked(op SetOp, keys [][]byte, weights []float64, agg Aggregate, limit int) ([]ZMember, error) {
+// zcombineLocked requires the shards of keys to be held. a is the access of
+// the command being served: ZUNION and friends only read their sources,
+// ZUNIONSTORE and friends replay verbatim and so must reap them.
+func (db *DB) zcombineLocked(op SetOp, keys [][]byte, weights []float64, agg Aggregate, limit int, a Access) ([]ZMember, error) {
 	inputs := make([][]ZMember, len(keys))
 	for i, k := range keys {
-		members, err := db.membersAsZSet(k)
+		members, err := db.membersAsZSet(k, a)
 		if err != nil {
 			return nil, err
 		}
@@ -838,9 +848,9 @@ func sortMembers(m []ZMember) {
 
 // membersAsZSet reads a key as a sorted set, accepting a plain set by giving
 // each of its members a score of 1. The shard must be held.
-func (db *DB) membersAsZSet(key []byte) ([]ZMember, error) {
+func (db *DB) membersAsZSet(key []byte, a Access) ([]ZMember, error) {
 	s := db.shardFor(key)
-	o := db.lookup(s, key)
+	o := db.get(s, key, a)
 	if o == nil {
 		return nil, nil
 	}
@@ -865,7 +875,7 @@ func (db *DB) ZCombineStore(op SetOp, dst []byte, keys [][]byte, weights []float
 	locked := db.lockKeys(all)
 	defer db.unlockShards(locked)
 
-	members, err := db.zcombineLocked(op, keys, weights, agg, 0)
+	members, err := db.zcombineLocked(op, keys, weights, agg, 0, WriteAccess)
 	if err != nil {
 		return 0, err
 	}

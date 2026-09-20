@@ -527,23 +527,23 @@ letting go means nothing new can land until the shard has been serialized.
 One extra uncontended mutex per write -- `BenchmarkSet` and `BenchmarkIncr`
 show no measurable change, and `BenchmarkGet` is untouched at 0 allocations
 because reads do not take it. Under contention, writes to the *same shard*
-now serialize across the handler and the log append. That is not really new:
-`Log.Append` already serializes every append globally, so the marginal loss
-is the handler's own execution time.
+now serialize across the handler and the log append.
 
-### Remaining gap: lazy expiry on the read path
+When this was written that cost nothing, because `Log.Append` serialized
+every append globally anyway. Group commit (issue 24) removed that: appends
+to different shards now proceed together and batch, so `prop` is the
+remaining serialization, and it is per shard rather than global.
 
-A read that finds an expired key reaps it and emits a `DEL`, under the shard's
-`mu` but without `prop`, because taking `prop` on every read would put every
-`GET` behind a concurrent write's log append.
+### The gap this left on the read path, and how it was closed
 
-The window is narrow -- a key must fall due in the instant between a writer
-mutating it and logging it, and the writer's own lookup would have reaped it
-on the way in -- but narrow is not closed. The fix worth pricing: have reads
-*hide* an expired key, as replica mode already does, and leave the deletion
-and the `DEL` to the active cycle, which holds `prop`. That makes reads
-cheaper as well, and it makes `active-expire no` a memory-leak setting rather
-than a correctness one, which should be stated if it is taken.
+A read that found an expired key reaped it and emitted a `DEL`, under the
+shard's `mu` but without `prop`, because taking `prop` on every read would
+put every `GET` behind a concurrent write's log append.
+
+The window was narrow -- a key had to fall due in the instant between a
+writer mutating it and logging it -- but narrow is not closed, and what came
+out of it was a log that replayed to a different keyspace than the one that
+wrote it. Issue 26 is how it was fixed, and what the proposed fix got wrong.
 
 ---
 
@@ -1469,3 +1469,104 @@ every record to replay exactly once. Against the old code it fails both ways
 on the first run.
 
 **A concurrency fix needs a test that rolls under load, not a test that rolls.**
+
+---
+
+## 26. Lazy expiry: reads hide, writes reap, and the obvious fix was wrong
+
+Issue 10 left one hole. A read that found an expired key reaped it and
+appended a `DEL` to the effect stream, and a read holds no propagation lock,
+so that `DEL` had no ordered position among concurrent writes. A log whose
+records are out of order replays to a different keyspace than the one that
+produced it.
+
+Issue 10 proposed the fix in one line: **have reads hide an expired key, as
+replica mode already does, and leave the deletion to the active cycle, which
+holds the lock.** That is half right, and the other half would have been a
+worse bug than the one it fixed.
+
+### Why hiding everywhere breaks replay
+
+Replay disables expiry. `Keyspace.SetLoading` makes `expiredAt` return false
+for everything, because every timestamp in a log is in the past by the time
+it is read, and a log that expired its own records as it replayed them would
+delete the dataset it was restoring.
+
+So nothing is hidden during replay. A write that had hidden an expired key
+and said nothing about it is replayed against the key it thought was gone:
+
+```
+leader:  key l expires; LPUSH l b  ->  hides the old list, starts a new one,
+                                       propagates "LPUSH l b"
+replay:  nothing expires        ->  LPUSH l b appends to the old list
+```
+
+The leader holds `[b]`. The restored server holds `[a, b]`. The same
+divergence reaches a replica whose clock has not yet passed the expiry.
+
+Under the old behaviour this could not happen, because the write's own lookup
+reaped the key and emitted `DEL l` ahead of the `LPUSH`. The log was
+self-sufficient. Hiding on the write path would have quietly removed that.
+
+### The split that is actually correct
+
+A read has nothing to say and no position to say it from. A write already
+holds the lock and is already appending. So:
+
+- **Reads hide.** No reap, no `DEL`, nothing appended. The key stays until
+  the active cycle takes it.
+- **Writes reap.** Exactly as before, under `prop`, `DEL` first and then the
+  write's own effect.
+
+The engine says which it is by which accessor family it uses -- `peek`,
+`peekRead`, `peekType` against `lookup`, `lookupType`, with `listAt`/
+`listRead` and the same pairing for sets, sorted sets and hashes. Choosing
+the wrong one of a pair is silent in both directions: a read that reaps
+misorders the log, a write that hides desynchronises the replay.
+
+Three methods serve both a read-only and a writing command over the same
+key -- `SORT` and `SORT_RO`, `SUNION` and `SUNIONSTORE`, `ZUNION` and
+`ZUNIONSTORE`. The difference is invisible inside the engine, so those take
+an explicit `engine.Access`. `SORT` is a write: it replays from its own
+arguments, so a replay re-reads its source and must see what the original run
+saw.
+
+### Making the classification checkable rather than careful
+
+Fifty call sites were classified by hand, and a wrong one fails at the next
+restart rather than at the call. `SetWriteOrderingAssertions` makes the
+engine verify, at the point of emission, that the caller holds the shard's
+propagation lock:
+
+```go
+if s.prop.TryLock() {
+	s.prop.Unlock()
+	panic("engine: effect emitted without the shard's propagation lock")
+}
+```
+
+The check is one-directional by construction. A successful `TryLock` proves
+nobody holds the lock, so there are no false positives; a failed one proves
+only that *somebody* does, which under concurrency need not be this
+goroutine, so a violation that races an unrelated writer is missed. It is off
+in production and on for the whole of `command`'s and `server`'s test
+binaries, which is where the dispatcher is the thing taking the lock.
+
+It is deliberately *not* on for `engine`'s own tests. They call `DB` methods
+directly and hold no propagation lock, so an always-on assertion would fire
+on every write in the package rather than on the mistake.
+
+### What it costs and what it gives up
+
+Reads get cheaper: the expiry path on a read is now a comparison and a
+return, with no deletion, no allocation of the key string, and no sink call.
+
+The cost is that an expired key read but never written stays resident until
+the active cycle reaches it. **`active-expire no` is now a memory-leak
+setting rather than a correctness one**, and that is worth stating plainly to
+anyone who sets it: with the active cycle off, expired keys are hidden
+correctly and freed never.
+
+`DBSIZE`, `KEYS`, `SCAN` and `RANDOMKEY` already filtered expired keys
+without reaping them, so they needed no change -- they had been written
+against the hiding rule all along.

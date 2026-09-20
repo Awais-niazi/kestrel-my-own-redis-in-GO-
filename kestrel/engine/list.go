@@ -460,7 +460,14 @@ func (l *List) Pos(v []byte, rank, count, maxlen int) []int {
 // ---------------------------------------------------------------- database
 
 func (db *DB) listAt(s *shard, key []byte) (*Object, *List, error) {
-	o, err := db.collectionAt(s, key, TypeList)
+	return asList(db.collectionAt(s, key, TypeList))
+}
+
+func (db *DB) listRead(s *shard, key []byte) (*Object, *List, error) {
+	return asList(db.collectionRead(s, key, TypeList))
+}
+
+func asList(o *Object, err error) (*Object, *List, error) {
 	if err != nil || o == nil {
 		return nil, nil, err
 	}
@@ -521,7 +528,7 @@ func (db *DB) LPop(key []byte, count int, front bool) ([][]byte, error) {
 func (db *DB) LLen(key []byte) (int64, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, l, err := db.listAt(s, key)
+	_, l, err := db.listRead(s, key)
 	if err != nil || l == nil {
 		return 0, err
 	}
@@ -532,7 +539,7 @@ func (db *DB) LLen(key []byte) (int64, error) {
 func (db *DB) LIndex(key []byte, i int64) ([]byte, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, l, err := db.listAt(s, key)
+	_, l, err := db.listRead(s, key)
 	if err != nil || l == nil {
 		return nil, false, err
 	}
@@ -564,7 +571,7 @@ func (db *DB) LSet(key []byte, i int64, v []byte) error {
 func (db *DB) LRange(key []byte, start, stop int64) ([][]byte, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, l, err := db.listAt(s, key)
+	_, l, err := db.listRead(s, key)
 	if err != nil || l == nil {
 		return nil, err
 	}
@@ -623,7 +630,7 @@ func (db *DB) LTrim(key []byte, start, stop int64) error {
 func (db *DB) LPos(key, v []byte, rank, count, maxlen int) ([]int, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	_, l, err := db.listAt(s, key)
+	_, l, err := db.listRead(s, key)
 	if err != nil || l == nil {
 		return nil, err
 	}

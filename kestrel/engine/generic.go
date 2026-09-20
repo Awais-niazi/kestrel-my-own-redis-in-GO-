@@ -26,7 +26,7 @@ func (db *DB) Exists(keys [][]byte) int64 {
 
 	var n int64
 	for _, k := range keys {
-		if db.lookupRead(db.shardFor(k), k) != nil {
+		if db.peekRead(db.shardFor(k), k) != nil {
 			n++
 		}
 	}
@@ -37,7 +37,7 @@ func (db *DB) Exists(keys [][]byte) int64 {
 func (db *DB) Type(key []byte) (ObjectType, bool) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o := db.lookupRead(s, key)
+	o := db.peekRead(s, key)
 	if o == nil {
 		return 0, false
 	}
@@ -48,7 +48,7 @@ func (db *DB) Type(key []byte) (ObjectType, bool) {
 func (db *DB) Encoding(key []byte) (Encoding, bool) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o := db.lookup(s, key)
+	o := db.peek(s, key)
 	if o == nil {
 		return 0, false
 	}

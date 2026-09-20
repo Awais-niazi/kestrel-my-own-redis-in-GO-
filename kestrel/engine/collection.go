@@ -91,6 +91,16 @@ func (db *DB) collectionAt(s *shard, key []byte, t ObjectType) (*Object, error) 
 	return db.lookupType(s, key, t)
 }
 
+// collectionRead is collectionAt for a command that only reads: it hides an
+// expired key instead of reaping it, because it holds no propagation lock.
+// Each type has a thin wrapper that unpacks the value -- listRead, setRead,
+// zsetRead, hashRead -- paired with the listAt, setAt, zsetAt and hashAt the
+// writes use. Choosing the wrong one of a pair is what
+// SetWriteOrderingAssertions exists to catch.
+func (db *DB) collectionRead(s *shard, key []byte, t ObjectType) (*Object, error) {
+	return db.peekType(s, key, t)
+}
+
 // finishWrite updates a collection object's encoding, its contribution to the
 // memory estimate, and removes the key entirely when nothing is left.
 //
@@ -125,11 +135,15 @@ type limitsHolder = atomic.Pointer[Thresholds]
 // SortSource returns the elements of a list, set or sorted set as a flat
 // slice, which is what SORT operates on. A sorted set contributes its
 // members in score order.
-func (db *DB) SortSource(key []byte) ([][]byte, bool, error) {
+//
+// SORT is a write -- it replays from its own arguments, so a replay re-reads
+// this key and must see what the original run saw -- while SORT_RO is not.
+// The caller says which it is.
+func (db *DB) SortSource(key []byte, a Access) ([][]byte, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
 
-	o := db.lookupRead(s, key)
+	o := db.get(s, key, a)
 	if o == nil {
 		return nil, false, nil
 	}

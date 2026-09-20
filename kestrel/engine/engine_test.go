@@ -245,7 +245,10 @@ func (r *recordingSink) all() []string {
 	return append([]string(nil), r.cmds...)
 }
 
-func TestExpiryPropagatesDelete(t *testing.T) {
+// A read holds no propagation lock, so it has no ordered position in the
+// effect stream and must not append to it. It hides the key instead and
+// leaves both the deletion and the DEL to a caller that does hold the lock.
+func TestReadHidesAnExpiredKeyWithoutPropagating(t *testing.T) {
 	ks, now := testKeyspace(t)
 	sink := &recordingSink{}
 	ks.SetEffectSink(sink)
@@ -253,12 +256,73 @@ func TestExpiryPropagatesDelete(t *testing.T) {
 
 	db.Set([]byte("k"), []byte("v"), SetOptions{At: *now + 10})
 	atomic.StoreInt64(now, *now+11)
-	getString(t, db, "k")
 
-	got := sink.all()
-	if len(got) != 1 || got[0] != "0:DEL k" {
-		t.Fatalf("got %v want [0:DEL k]", got)
+	// With the assertion on, a read that reaps fails here by panicking in
+	// the caller rather than by diverging at the next restart.
+	SetWriteOrderingAssertions(true)
+	defer SetWriteOrderingAssertions(false)
+
+	if _, ok := getString(t, db, "k"); ok {
+		t.Fatal("a read served an expired key")
 	}
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("a read appended to the effect stream: %v", got)
+	}
+	if !stillPresent(db, "k") {
+		t.Fatal("a read deleted the key without saying so")
+	}
+
+	// The active cycle does hold the lock, and it is what reports the death.
+	ks.ExpirePass(time.Now().Add(time.Second))
+	if got := sink.all(); len(got) != 1 || got[0] != "0:DEL k" {
+		t.Fatalf("active expiry produced %v, want [0:DEL k]", got)
+	}
+	if stillPresent(db, "k") {
+		t.Fatal("active expiry left the key behind")
+	}
+}
+
+// A write does hold the lock, and it must reap rather than hide: replay
+// disables expiry, so a write that saw an expired key and did not say so
+// would be replayed against the key it thought was gone.
+func TestWriteReapsAnExpiredKeyBeforeItsOwnEffect(t *testing.T) {
+	ks, now := testKeyspace(t)
+	sink := &recordingSink{}
+	ks.SetEffectSink(sink)
+	db := ks.DB(0)
+
+	if _, err := db.LPush([]byte("l"), [][]byte{[]byte("a")}, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := db.Expire([]byte("l"), *now+10, 0); !ok {
+		t.Fatal("EXPIRE did not apply")
+	}
+	atomic.StoreInt64(now, *now+11)
+	sink.cmds = nil
+
+	// LPUSH replays from its own arguments, so the log has to say the old
+	// list is gone before the new element lands or the replay appends to it.
+	// The lock is taken the way the command layer takes it, which is also
+	// what lets the assertion run over this call.
+	SetWriteOrderingAssertions(true)
+	defer SetWriteOrderingAssertions(false)
+	order := db.OrderWrites([][]byte{[]byte("l")})
+	n, err := db.LPush([]byte("l"), [][]byte{[]byte("b")}, true, false)
+	order.Done()
+	if err != nil || n != 1 {
+		t.Fatalf("LPUSH onto an expired list gave %d, %v; want a fresh list of 1", n, err)
+	}
+	if got := sink.all(); len(got) != 1 || got[0] != "0:DEL l" {
+		t.Fatalf("the write produced %v, want [0:DEL l] before its own effect", got)
+	}
+}
+
+func stillPresent(db *DB, key string) bool {
+	s := db.shardFor([]byte(key))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.dict[key]
+	return ok
 }
 
 func TestReplicaHidesButDoesNotDelete(t *testing.T) {

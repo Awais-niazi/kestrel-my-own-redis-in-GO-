@@ -53,7 +53,7 @@ func valueSize(o *Object) int64 {
 func (db *DB) MemoryUsage(key []byte) (int64, bool) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
-	o := db.lookup(s, key)
+	o := db.peek(s, key)
 	if o == nil {
 		return 0, false
 	}
