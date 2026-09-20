@@ -236,12 +236,23 @@ func (l *Log) startSegmentLocked(seq int, base uint64) error {
 }
 
 // Append writes one effect and returns the stream offset it was written at.
+//
+// The read lock is held across the segment's own append, not merely while
+// l.cur is read. Releasing it early lets Roll close the segment out from
+// under an appender that has already chosen it, which fails a write that
+// nothing was wrong with, and -- worse -- lets that appender's record land
+// in a file after Roll has recorded where that file ends. Recovery then
+// finds two segments claiming the same offsets and refuses to load.
+//
+// Holding it costs nothing here because it is a read lock: appenders do not
+// exclude each other, so a batch still forms. It excludes only Roll, Prune,
+// Reset and Close, which is exactly the set that must not run while a record
+// is in flight.
 func (l *Log) Append(db int, args [][]byte) (uint64, error) {
 	l.mu.RLock()
-	cur := l.cur
+	at, err := l.cur.Append(db, args)
 	l.mu.RUnlock()
 
-	at, err := cur.Append(db, args)
 	if err == nil {
 		l.wake()
 	}
@@ -293,18 +304,22 @@ func (l *Log) Roll() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	at := l.cur.Offset()
 	seq := l.segs[len(l.segs)-1].Seq + 1
 	defer l.wake()
-	if err := l.cur.Sync(); err != nil {
-		return err
-	}
-	// The finished segment's recorded end is fixed at the point the new one
-	// begins, so that a later contiguity check compares the two directly.
-	l.segs[len(l.segs)-1].End = at
 	if err := l.cur.Close(); err != nil {
 		return err
 	}
+	// The end is taken from the closed segment, after everything staged in
+	// it has been written and nothing more can be. Reading it earlier
+	// reports only what has reached the file, which under group commit is
+	// behind what has been handed out: the segment then grows past the point
+	// recorded as its end, the next one starts before the previous one
+	// finishes, and recovery refuses a log whose segments overlap.
+	//
+	// The finished segment's recorded end is fixed at the point the new one
+	// begins, so that a later contiguity check compares the two directly.
+	at := l.cur.Offset()
+	l.segs[len(l.segs)-1].End = at
 	return l.startSegmentLocked(seq, at)
 }
 
@@ -360,10 +375,9 @@ func (l *Log) Prune(below uint64) (removed int, freed int64, err error) {
 // recognises without any translation.
 func (l *Log) AppendRaw(raw []byte) (uint64, error) {
 	l.mu.RLock()
-	cur := l.cur
+	at, err := l.cur.AppendRaw(raw)
 	l.mu.RUnlock()
 
-	at, err := cur.AppendRaw(raw)
 	if err == nil {
 		l.wake()
 	}

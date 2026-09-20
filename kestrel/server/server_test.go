@@ -58,6 +58,9 @@ type testServer struct {
 	done      chan error
 	waitOnce  sync.Once
 	waitErr   error
+
+	// exited stops the readiness poller once Serve has returned.
+	exited chan struct{}
 }
 
 // wait blocks until Serve returns, at most once, so both a test and the
@@ -98,7 +101,11 @@ func startServer(t *testing.T, tweaks ...func(*config.Config)) *testServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := &testServer{Server: srv, port: port, adminPort: adminPort, done: make(chan error, 1)}
+	ts := &testServer{
+		Server: srv, port: port, adminPort: adminPort,
+		done:   make(chan error, 1),
+		exited: make(chan struct{}),
+	}
 	go func() { ts.done <- srv.Serve(context.Background()) }()
 
 	// Wait until the server is actually serving, not merely bound.
@@ -108,7 +115,7 @@ func startServer(t *testing.T, tweaks ...func(*config.Config)) *testServer {
 	// PING that comes back is the only thing that proves the accept loop is
 	// running, and everything set up before it -- the keyspace, the log --
 	// is ordered before that by the goroutine that answers.
-	waitReady(t, ts.addr())
+	waitReadyOrExit(t, ts)
 	t.Cleanup(func() {
 		srv.Shutdown(false)
 		if err := ts.wait(t); err != nil {
@@ -563,6 +570,43 @@ func TestInfoSections(t *testing.T) {
 	}
 	if !strings.Contains(string(c.do("INFO", "all").Str), "# Latencystats") {
 		t.Error("INFO all is missing latencystats")
+	}
+}
+
+// waitReadyOrExit waits for the server to answer, and reports it as an exit
+// rather than a timeout when Serve returns first.
+//
+// Waiting only on the port cannot tell the two apart: the listener is bound
+// before recovery runs, so a server that gives up during startup leaves a
+// port that accepts into the kernel backlog and never answers. Polling that
+// port looks exactly like a slow start until the deadline runs out, and the
+// reason Serve stopped -- which is the thing worth knowing -- is read much
+// later by the cleanup hook, if at all.
+func waitReadyOrExit(t *testing.T, ts *testServer) {
+	t.Helper()
+	ready := make(chan struct{})
+	go func() {
+		defer close(ready)
+		for {
+			if pingOK(ts.addr()) {
+				return
+			}
+			select {
+			case <-ts.exited:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	select {
+	case <-ready:
+		return
+	case err := <-ts.done:
+		ts.waitOnce.Do(func() { ts.waitErr = err })
+		close(ts.exited)
+		t.Fatalf("the server exited during startup instead of serving: %v", err)
+	case <-time.After(15 * time.Second):
+		t.Fatalf("server at %s did not answer PING within 15s", ts.addr())
 	}
 }
 

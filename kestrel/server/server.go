@@ -280,8 +280,33 @@ func (s *Server) Shutdown(save bool) error {
 
 // Serve opens the listeners and blocks until the server is shut down or ctx
 // is cancelled.
-func (s *Server) Serve(ctx context.Context) error {
+func (s *Server) Serve(ctx context.Context) (err error) {
 	snap := s.cfg.Snapshot()
+
+	// Startup binds its ports before it does the work that can fail, so that
+	// a client connecting during a long replay waits rather than being
+	// refused. That makes it this function's job to unbind them again when
+	// the work does fail: a Serve that returns an error with its listeners
+	// still open leaves a port that accepts into the kernel backlog and
+	// never answers anything. To a health check, or to anything else that
+	// only dials, that is indistinguishable from a server which is still
+	// starting, so the failure presents as a hang rather than as the error
+	// it already has in hand.
+	serving := false
+	defer func() {
+		if serving {
+			return
+		}
+		for _, l := range s.listeners {
+			l.Close()
+		}
+		if s.admin != nil {
+			s.admin.stop()
+		}
+		if s.persist != nil {
+			s.persist.Close()
+		}
+	}()
 
 	if snap.Port != 0 {
 		l, err := listen(snap.Bind, snap.Port, snap.TCPBacklog)
@@ -359,6 +384,7 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	s.workers.Add(1)
 	go s.idleReaper()
+	serving = true
 
 	select {
 	case <-ctx.Done():

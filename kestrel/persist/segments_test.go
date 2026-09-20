@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func openTestLog(t *testing.T, dir string) *Log {
@@ -341,5 +344,96 @@ func TestLogStatsCountEverySegment(t *testing.T) {
 	}
 	if st.Size != onDisk {
 		t.Errorf("Stats reports %d bytes, the files hold %d", st.Size, onDisk)
+	}
+}
+
+// TestRollUnderConcurrentAppendsKeepsTheStreamWhole rolls the log while
+// several goroutines are appending to it.
+//
+// Two things went wrong here and neither showed up in a test that rolled a
+// quiet log. Append chose l.cur under the read lock and then released it
+// before appending, so Roll could close that segment underneath an appender:
+// the write failed for no reason, and any record that did land arrived after
+// Roll had recorded where the file ended. Roll took that end from the
+// segment's flushed offset before syncing it, which under group commit is
+// behind what has been handed out, so the file grew past its recorded end and
+// the next segment began before the previous one finished.
+//
+// Either one produces a log that loads no more: Segments reports overlapping
+// or non-contiguous files and recovery refuses to start. The server that
+// wrote it keeps running and looks healthy until it is restarted.
+func TestRollUnderConcurrentAppendsKeepsTheStreamWhole(t *testing.T) {
+	dir := t.TempDir()
+	l := openTestLog(t, dir)
+
+	const writers = 8
+	const perWriter = 400
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				_, err := l.Append(0, cmd("SET", fmt.Sprintf("k%d-%d", w, i), "v"))
+				if err != nil {
+					failures.Add(1)
+					t.Errorf("append %d of writer %d failed: %v", i, w, err)
+					return
+				}
+			}
+		}(w)
+	}
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := l.Roll(); err != nil {
+				failures.Add(1)
+				t.Errorf("roll failed: %v", err)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	wg.Wait()
+	close(stop)
+
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The in-memory view and the files on disk must agree, and both must be
+	// one unbroken stream.
+	for i, s := range l.Segments() {
+		if i > 0 && s.Base != l.Segments()[i-1].End {
+			t.Fatalf("segment %d begins at %d but the previous one ends at %d",
+				s.Seq, s.Base, l.Segments()[i-1].End)
+		}
+	}
+	onDisk, err := Segments(dir)
+	if err != nil {
+		t.Fatalf("the log will not load: %v", err)
+	}
+	if got, want := onDisk[len(onDisk)-1].End, l.Offset(); got != want {
+		t.Errorf("the files end at %d but the log says %d", got, want)
+	}
+
+	// Every record must still be there, exactly once.
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var c collector
+	res, err := Recover(RecoverOptions{Dir: dir}, &c)
+	if err != nil {
+		t.Fatalf("the rolled log will not replay: %v", err)
+	}
+	if want := int64(writers * perWriter); res.Records != want && failures.Load() == 0 {
+		t.Errorf("replayed %d records, want %d", res.Records, want)
 	}
 }

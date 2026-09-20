@@ -129,19 +129,21 @@ func TestBgSaveAndBgRewriteAof(t *testing.T) {
 	c := ts.connect(t)
 	c.do("SET", "k", "v")
 
+	since := ts.persist.saves.Load()
 	if got := text(c.do("BGSAVE")); got != "Background saving started" {
 		t.Errorf("BGSAVE returned %q", got)
 	}
-	waitForSnapshot(t, ts)
+	waitForSnapshot(t, ts, since)
 	if _, err := os.Stat(filepath.Join(dir, snapshotFileName)); err != nil {
 		t.Fatalf("BGSAVE wrote no snapshot: %v", err)
 	}
 
 	c.do("SET", "k2", "v2")
+	since = ts.persist.saves.Load()
 	if got := text(c.do("BGREWRITEAOF")); got != "Background append only file rewriting started" {
 		t.Errorf("BGREWRITEAOF returned %q", got)
 	}
-	waitForSnapshot(t, ts)
+	waitForSnapshot(t, ts, since)
 
 	stop(t, ts)
 	second := durableServer(t, dir)
@@ -152,11 +154,19 @@ func TestBgSaveAndBgRewriteAof(t *testing.T) {
 }
 
 // waitForSnapshot blocks until no snapshot is in flight.
-func waitForSnapshot(t *testing.T, ts *testServer) {
+// waitForSnapshot blocks until one more save than since has completed.
+//
+// The caller passes the save count it read before asking for the save. The
+// obvious conditions are both wrong: lastSave is seeded with the server's
+// start time, so waiting for it to be non-zero is satisfied the instant
+// BGSAVE returns and the test then looks for a file nobody has written yet;
+// and lastSave has second granularity, so waiting for it to advance never
+// finishes when the save lands in the same second.
+func waitForSnapshot(t *testing.T, ts *testServer, since uint64) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if !ts.persist.running.Load() && ts.persist.lastSave.Load() > 0 {
+		if ts.persist.saves.Load() > since && !ts.persist.running.Load() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)

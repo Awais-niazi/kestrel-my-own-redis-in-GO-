@@ -1367,3 +1367,105 @@ that has nothing to do with locking. Twelve targeted reruns failed to
 reproduce it; it was found by reading the code for who could wait without
 registering. **A conditional broadcast needs every waiter to be counted, and
 a waiter added later is the one that will be forgotten.**
+
+---
+
+## 25. Group commit's fourth failure: it corrupted the log on a roll
+
+Issue 24 recorded three ways group commit did not work. Here is the fourth,
+found a chunk later, and the worst of them: **it wrote logs that could not be
+read back.**
+
+```
+kestrel-000001.log ends at offset 77772 but kestrel-000002.log begins at 77729;
+the records between them are in no file
+```
+
+The segments overlap by 43 bytes -- one record. A server that produced this
+kept running and looked healthy. The damage was invisible until it was
+restarted, and then it would not start at all.
+
+### Two bugs, one decision
+
+Both come from the same line. To make batching possible, `Log.Append` read
+`l.cur` under the read lock and released it *before* appending:
+
+```go
+l.mu.RLock()
+cur := l.cur
+l.mu.RUnlock()
+at, err := cur.Append(db, args)
+```
+
+That was a correction to a real problem -- issue 24 records how holding the
+lock across the append serialised every writer so no batch could ever form --
+but it was the wrong correction, because it was made against a `sync.Mutex`
+and kept after the lock became a `sync.RWMutex`. A *read* lock does not need
+releasing: appenders do not exclude each other under it. Releasing it bought
+nothing and gave up the only thing it was doing.
+
+**First:** `Roll` takes the write lock and closes the segment. An appender
+that had already chosen that segment then appends to a closed file and its
+write fails, for no reason the operator can see.
+
+**Second, and worse:** an appender that gets its record in *after* `Roll` has
+recorded where the file ends puts bytes past that recorded end. The next
+segment is declared to begin at the same offset. Two files then claim the
+same range, and `Segments` refuses the whole log.
+
+### The end of a segment cannot be read before the segment stops growing
+
+`Roll` also took the end from `l.cur.Offset()` *before* syncing:
+
+```go
+at := l.cur.Offset()   // what has reached the file
+...
+l.cur.Sync()           // writes what was still staged
+l.segs[last].End = at  // too small by whatever was staged
+```
+
+Before group commit these were the same number, because every append reached
+the file before it returned. Group commit introduced the gap between
+*assigned* and *written* and this line was not revisited. `Roll` now closes
+the segment first -- which drains it, and after which nothing more can be
+appended -- and reads the end from the closed file.
+
+**A number that was safe to read early is only safe while nothing buffers.**
+
+### How it presented, and why that mattered more than the bug
+
+The symptom was a test timing out after fifteen seconds with "server did not
+answer PING". Not a corruption error -- a *hang*.
+
+Startup binds its ports before recovery runs, deliberately, so a client
+arriving during a long replay waits instead of being refused. But `Serve`
+returned recovery's error without closing what it had already bound. The port
+stayed open, accepted into the kernel backlog, and answered nothing. The test
+harness polled that port, could not tell "still starting" from "gave up ten
+seconds ago", and reported a timeout while the real error sat unread in a
+channel.
+
+That is a production failure in its own right, and a nastier one than the
+corruption: **a health check that only dials would call that server healthy.**
+`Serve` now unbinds everything it bound if startup does not complete, and the
+test harness waits on the server's exit as well as on its port, so a startup
+that fails reports the failure instead of a deadline.
+
+**A test that cannot distinguish "not yet" from "never" will always report
+the less useful of the two.**
+
+### What found it
+
+Nothing that was looking for it. The race detector never fired -- every
+access is correctly locked; the locking is simply not held long enough. The
+persistence tests rolled quiet logs and passed. It surfaced as an unrelated
+snapshot test failing about one run in three under `-count=5`, and was
+identified only after the harness was changed to report *why* the server was
+not answering.
+
+The test that now covers it appends from eight goroutines while a ninth rolls
+the log in a loop, then requires the segments to be contiguous on disk and
+every record to replay exactly once. Against the old code it fails both ways
+on the first run.
+
+**A concurrency fix needs a test that rolls under load, not a test that rolls.**

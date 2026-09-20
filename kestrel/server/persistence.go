@@ -46,6 +46,12 @@ type persistence struct {
 
 	lastSave atomic.Int64 // unix seconds
 
+	// saves counts completed snapshots. lastSave has second granularity, so
+	// a save that finishes in the same second it was asked for is
+	// indistinguishable from no save at all; this counter is what tells a
+	// waiter that the save it asked for is the one that has finished.
+	saves atomic.Uint64
+
 	// running guards against two snapshots at once. A second pass would
 	// overwrite the first's temporary file and produce anchors from two
 	// different walks.
@@ -329,6 +335,7 @@ func (p *persistence) Snapshot(s *Server) (SnapshotOutcome, error) {
 	out.SegmentsRemoved, out.BytesFreed = removed, freed
 
 	p.lastSave.Store(time.Now().Unix())
+	p.saves.Add(1)
 	p.snapshotLast.Store(info.Last)
 	p.changesAtSave.Store(s.ks.Stats().Changes)
 	p.sizeAtSave.Store(p.log.Stats().Size)

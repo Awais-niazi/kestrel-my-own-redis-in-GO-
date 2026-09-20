@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"kestrel/config"
 	"kestrel/persist"
@@ -213,6 +215,23 @@ func TestCorruptLogPolicyRefuse(t *testing.T) {
 		t.Fatal("the server started on a corrupt log under the refuse policy")
 	} else if !errors.Is(err, persist.ErrCorrupt) {
 		t.Errorf("error %v does not name the corruption", err)
+	}
+
+	// The ports are bound before recovery runs, so a startup that gives up
+	// has to unbind them. Leaving them open is worse than the failure it
+	// follows: the port accepts into the kernel backlog and never answers,
+	// which anything that only dials -- a health check, a load balancer --
+	// reads as a server that is still starting.
+	addr := net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
+	nc, dialErr := net.DialTimeout("tcp", addr, time.Second)
+	if dialErr == nil {
+		nc.Close()
+		t.Errorf("%s still accepts connections after Serve gave up", addr)
+	}
+	adminAddr := net.JoinHostPort("127.0.0.1", fmt.Sprint(adminPort))
+	if nc, dialErr := net.DialTimeout("tcp", adminAddr, time.Second); dialErr == nil {
+		nc.Close()
+		t.Errorf("the admin server on %s outlived the failed startup", adminAddr)
 	}
 }
 
