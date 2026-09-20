@@ -38,8 +38,9 @@ appendfsync everysec   a crash loses at most a second; a process kill loses noth
 appendfsync no         the operating system decides
 ```
 
-`always` is the honest option and an expensive one: it costs a disk flush per
-command, which measured about 220 writes a second on the development host.
+`always` is the honest option and an expensive one, but it is no longer one
+flush per command: concurrent writes share a flush, which measured 5,259
+writes a second against 795 before batching, at 7.1 records per fsync.
 `everysec` is the default.
 
 A log that cannot be read to its end is handled by `corrupt-log-policy`. A

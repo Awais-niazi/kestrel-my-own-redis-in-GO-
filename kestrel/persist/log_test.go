@@ -478,3 +478,123 @@ func TestParseFsync(t *testing.T) {
 		t.Error("an unknown policy was accepted")
 	}
 }
+
+// TestGroupCommitBatchesUnderConcurrency is the property, asserted by
+// counting rather than by timing: many appends arriving together must share
+// a flush instead of each paying for one.
+func TestGroupCommitBatchesUnderConcurrency(t *testing.T) {
+	l := tempLog(t, segmentOptions{Fsync: FsyncAlways})
+	const writers, each = 8, 60
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				if _, err := l.Append(0, cmd("SET", fmt.Sprintf("k%d-%d", w, i), "v")); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	st := l.Stats()
+	total := int64(writers * each)
+	if st.Writes != total {
+		t.Fatalf("%d records staged, want %d", st.Writes, total)
+	}
+	if st.Syncs >= total {
+		t.Errorf("%d syncs for %d records: appends are not sharing a flush",
+			st.Syncs, total)
+	}
+	t.Logf("%d records reached disk in %d flushes", total, st.Syncs)
+
+	// Every record is there, exactly once, despite sharing writes.
+	got, r := readAll(t, l.Path())
+	if r.Err() != nil {
+		t.Fatalf("batched appends produced an unreadable log: %v", r.Err())
+	}
+	if len(got) != int(total) {
+		t.Fatalf("read %d records, want %d", len(got), total)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, g := range got {
+		if seen[g] {
+			t.Fatalf("duplicate record %q", g)
+		}
+		seen[g] = true
+	}
+}
+
+// TestAppendIsDurableWhenItReturns is the guarantee batching must not
+// weaken: a record is in the file by the time its appender is told so, even
+// though another goroutine did the writing.
+func TestAppendIsDurableWhenItReturns(t *testing.T) {
+	l := tempLog(t, segmentOptions{Fsync: FsyncAlways})
+	const writers = 6
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				at, err := l.Append(0, cmd("SET", fmt.Sprintf("k%d-%d", w, i), "v"))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				// The record it was just given an offset for must be
+				// readable from the file, now, by anyone.
+				if off := l.Offset(); off <= at {
+					t.Errorf("Append returned offset %d but the log reports %d; "+
+						"the record is not in the file yet", at, off)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+}
+
+// TestFailedBatchFailsEveryAppender: a batch that could not be written must
+// be reported as failed to every caller whose record it carried, not only to
+// whichever one happened to be doing the writing.
+func TestFailedBatchFailsEveryAppender(t *testing.T) {
+	l := tempLog(t, segmentOptions{Fsync: FsyncNo})
+	if _, err := l.Append(0, cmd("SET", "before", "ok")); err != nil {
+		t.Fatal(err)
+	}
+
+	l.mu.Lock()
+	l.f.Close()
+	l.mu.Unlock()
+
+	const writers = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	succeeded := 0
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			if _, err := l.Append(0, cmd("SET", fmt.Sprint(w), "v")); err == nil {
+				mu.Lock()
+				succeeded++
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if succeeded != 0 {
+		t.Errorf("%d of %d appenders were told a failed write succeeded",
+			succeeded, writers)
+	}
+	if l.Err() == nil {
+		t.Error("the failure was not recorded on the log")
+	}
+}

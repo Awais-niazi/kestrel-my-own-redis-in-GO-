@@ -270,18 +270,8 @@ against 1343 serial: eight goroutines appending are three times *slower* per
 operation than one. The `write(2)` happens under the log mutex, so
 concurrency turns into queueing at a syscall.
 
-Both have the same fix, which is deliberately not in this chunk: **group
-commit.** Batch the records that arrive while a write or an fsync is in
-flight, and issue one `write` and one `fsync` for the batch. Under `always`
-the batch amortizes the fsync across every client waiting on it, which is
-where the four orders of magnitude come back; under `everysec` it collapses
-the syscall queue.
-
-It is not in this chunk because it is an optimization with a correctness
-surface -- a batch that reports success to a client whose record was in a
-failed write is a lie about durability -- and it should be built against a
-recovery path that can prove it, which is chunk C. The numbers above are the
-baseline it has to beat.
+Both have the same fix: **group commit**, which is now implemented. See
+issue 24 for what it did and what it cost to get right.
 
 ### Why the log does not reuse the `resp` package
 
@@ -1300,3 +1290,80 @@ Selectors -- the `(...)` syntax for alternate permission sets -- and the
 `docs/deviations.md`. Passwords are SHA-256 hashed as in the reference
 implementation, compared in constant time, and never stored or reported in
 plaintext.
+
+---
+
+## 24. Group commit, and three ways it did not work
+
+Issue 7 measured `appendfsync always` at about 220 writes a second -- a disk
+flush per command -- and eight concurrent appenders running *slower* per
+operation than one, because the `write(2)` happened under the log mutex.
+
+Group commit fixes both: records are staged into a shared buffer, and one of
+the waiting appenders writes the whole buffer out. N concurrent appends cost
+one `write` and one `fsync` instead of N of each.
+
+**Measured on a real server**, `appendfsync always`, 50 clients, 20,000
+writes spread over 100,000 keys:
+
+| | Before | After |
+|---|---|---|
+| Throughput | ~795 writes/s | **5,259 writes/s** |
+| fsyncs per write | 1.00 | **0.14** (7.1 records per flush) |
+
+An appender still returns only once the batch carrying its record has been
+written, and forced under `always`. The guarantee is unchanged: an
+acknowledged write is on stable storage. A batch that fails is reported as
+failed to *every* caller whose record it carried, not only to whoever
+happened to be doing the writing -- which is the lie group commit exists to
+avoid introducing.
+
+### It made the uncontended case three times slower
+
+The first version staged every append and went through the condition
+variable even when nothing else was in flight. `BenchmarkAppend/no` went from
+1055 ns to 3668 ns and gained an allocation per call.
+
+Two fixes. The pending and spare buffers are swapped rather than reallocated,
+which removes the allocation. And an append that arrives with nothing else in
+flight writes itself and skips the batching machinery entirely: **group
+commit is worth what it costs only when there is a group.** That brought the
+uncontended path back to 1234 ns.
+
+### It never formed a batch at all, and every test passed
+
+`Log.Append` held the *log's* mutex across the segment's append. Every writer
+was therefore serialised before it could reach the batching code, so only one
+append was ever in flight and a batch could never form.
+
+Nothing in the test suite noticed, because every test that mattered was
+checking correctness, and the code was correct -- it was simply doing no
+batching. It was found by running `redis-benchmark` against a real server and
+reading two numbers out of `INFO`: `aol_writes:20000, aol_fsyncs:20000`. A
+ratio of exactly 1.00 is not a performance disappointment, it is a
+mechanism that is not running.
+
+The log's lock is now shared for appends and exclusive for rolling, pruning
+and closing. The segment does its own ordering underneath.
+
+**A performance feature needs a test that fails when it stops working.**
+There is now one at each level: the log counts flushes against records, and
+the server does the same through real connections. Both assert a ratio rather
+than a rate, because a rate is a fact about the disk and the ratio is a fact
+about the code.
+
+### It deadlocked about one run in three
+
+`drainLocked` waited on the flush condition without incrementing the waiter
+count, and `flushLocked` only broadcast when that count was above zero. A
+drainer could therefore sleep with nobody left to wake it.
+
+That alone would be a hang in a background sync. What made it fatal is that
+`Roll` drains while holding the log's exclusive lock, so a missed wake-up
+wedged every append in the server, and shutdown with it.
+
+The race suite found it, intermittently, in a test about snapshot scheduling
+that has nothing to do with locking. Twelve targeted reruns failed to
+reproduce it; it was found by reading the code for who could wait without
+registering. **A conditional broadcast needs every waiter to be counted, and
+a waiter added later is the one that will be forgotten.**

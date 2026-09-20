@@ -75,12 +75,22 @@ type segmentOptions struct {
 type segment struct {
 	path string
 
-	mu     sync.Mutex
-	f      *os.File
-	buf    []byte // reused encode buffer
-	offset uint64 // stream offset just past the last record
-	dirty  bool   // written to the OS but not yet forced
-	err    error
+	mu      sync.Mutex
+	f       *os.File
+	scratch []byte // reused encode buffer
+	// pending holds records staged but not yet written. assigned counts
+	// past them; offset counts only what has reached the file, so a
+	// follower reading up to offset can never see a record that is still
+	// in this buffer.
+	pending   []byte
+	spare     []byte // swapped with pending so a batch costs no allocation
+	waiters   int
+	assigned  uint64
+	offset    uint64
+	flushing  bool
+	flushWait *sync.Cond
+	dirty     bool // written to the OS but not yet forced
+	err       error
 
 	fsync atomic.Int32
 
@@ -155,17 +165,34 @@ func openSegment(opts segmentOptions) (*segment, error) {
 
 func startSegment(f *os.File, opts segmentOptions, offset uint64) *segment {
 	l := &segment{
-		path:   opts.Path,
-		f:      f,
-		offset: offset,
-		buf:    make([]byte, 0, 4096),
-		stop:   make(chan struct{}),
+		path:     opts.Path,
+		f:        f,
+		offset:   offset,
+		assigned: offset,
+		scratch:  make([]byte, 0, 4096),
+		stop:     make(chan struct{}),
 	}
+	l.flushWait = sync.NewCond(&l.mu)
 	l.fsync.Store(int32(opts.Fsync))
 	l.wg.Add(1)
 	go l.syncLoop()
 	return l
 }
+
+// Group commit.
+//
+// A record is staged into a shared buffer and one of the waiting appenders
+// writes the whole buffer out, so N concurrent appends cost one write(2) and
+// one fsync rather than N of each. Under appendfsync always that is the
+// difference between a disk flush per command and one per batch, which is
+// the four orders of magnitude issue 7 measured.
+//
+// An appender returns only once the batch covering its record has been
+// written -- and forced, under always. That is what keeps the guarantee the
+// simple version gave: an acknowledged write is on stable storage, and a
+// record that was in a failed write is reported as failed to every caller
+// whose record it carried, not just to whoever happened to be holding the
+// lock.
 
 // Append writes one effect and returns the stream offset it was written at.
 //
@@ -180,25 +207,136 @@ func (l *segment) Append(db int, args [][]byte) (uint64, error) {
 		return 0, l.err
 	}
 
-	if n := recordSize(args); cap(l.buf) < n {
-		l.buf = make([]byte, 0, n)
+	if n := recordSize(args); cap(l.scratch) < n {
+		l.scratch = make([]byte, 0, n)
 	}
-	l.buf = encodeRecord(l.buf[:0], db, KindEffect, args)
+	l.scratch = encodeRecord(l.scratch[:0], db, KindEffect, args)
+	return l.stageLocked(l.scratch)
+}
 
-	at := l.offset
-	if _, err := l.f.Write(l.buf); err != nil {
-		return 0, l.fail(err)
-	}
-	l.offset += uint64(len(l.buf))
-	l.dirty = true
+// stageLocked adds framed bytes to the pending batch and waits for it to
+// reach the file. The lock must be held; it is released while writing.
+//
+// An append that arrives with nothing else in flight writes itself and skips
+// the batching machinery entirely. That case is the common one on a server
+// that is not saturated, and making it pay for a condition variable it never
+// waits on turned a one-syscall write into three times the work. Group
+// commit is worth what it costs only when there is a group.
+func (l *segment) stageLocked(raw []byte) (uint64, error) {
+	at := l.assigned
+	l.pending = append(l.pending, raw...)
+	l.assigned += uint64(len(raw))
 	l.writes.Add(1)
+	target := l.assigned
 
-	if Fsync(l.fsync.Load()) == FsyncAlways {
-		if err := l.syncLocked(); err != nil {
+	if !l.flushing && l.waiters == 0 {
+		if err := l.flushLocked(); err != nil {
+			return 0, err
+		}
+		if l.offset >= target {
+			return at, nil
+		}
+	}
+
+	for {
+		if l.err != nil {
+			return 0, l.err
+		}
+		if l.offset >= target {
+			return at, nil
+		}
+		if l.flushing {
+			// Someone else is writing a batch. It may not cover this
+			// record, so the wait resumes the loop rather than returning.
+			l.waiters++
+			l.flushWait.Wait()
+			l.waiters--
+			continue
+		}
+		if err := l.flushLocked(); err != nil {
 			return 0, err
 		}
 	}
-	return at, nil
+}
+
+// drainLocked writes every staged record, waiting out a flush in progress.
+func (l *segment) drainLocked() error {
+	for {
+		if l.err != nil {
+			return l.err
+		}
+		if l.flushing {
+			// The waiter count must be kept here too. flushLocked only
+			// broadcasts when someone is waiting, and a drainer that slept
+			// without registering would be missed and never woken -- which
+			// wedges Roll, and with it every append, because Roll drains
+			// while holding the log's exclusive lock.
+			l.waiters++
+			l.flushWait.Wait()
+			l.waiters--
+			continue
+		}
+		if len(l.pending) == 0 {
+			return nil
+		}
+		if err := l.flushLocked(); err != nil {
+			return err
+		}
+	}
+}
+
+// flushLocked writes the pending batch and wakes everyone waiting on it.
+//
+// The write happens with the lock released, so appenders continue staging
+// into the next batch while this one is in flight. That is what makes the
+// batch grow under load: the busier the server, the more records each write
+// carries.
+func (l *segment) flushLocked() error {
+	// The two buffers are swapped rather than reallocated. Staging into a
+	// fresh slice each time put an allocation on every append, which on
+	// this path is measurable against the syscall it is meant to amortise.
+	batch := l.pending
+	l.pending = l.spare[:0]
+	l.flushing = true
+	policy := Fsync(l.fsync.Load())
+	end := l.offset + uint64(len(batch))
+
+	l.mu.Unlock()
+	_, writeErr := l.f.Write(batch)
+	var syncErr error
+	var syncTook time.Duration
+	if writeErr == nil && policy == FsyncAlways {
+		start := time.Now()
+		syncErr = l.f.Sync()
+		syncTook = time.Since(start)
+	}
+	l.mu.Lock()
+
+	l.flushing = false
+	l.spare = batch[:0]
+	if l.waiters > 0 {
+		defer l.flushWait.Broadcast()
+	}
+
+	if writeErr != nil {
+		// The batch is gone and its records are not in the file. Every
+		// appender waiting on it must be told, which the sticky error does:
+		// reporting success to some of them because the lock came back
+		// here first is exactly the lie group commit must not introduce.
+		return l.fail(writeErr)
+	}
+	l.offset = end
+	if policy == FsyncAlways {
+		if syncErr != nil {
+			return l.fail(syncErr)
+		}
+		l.lastSyncN.Store(int64(syncTook))
+		l.syncs.Add(1)
+		l.dirty = false
+	} else {
+		l.dirty = true
+	}
+	return nil
 }
 
 // AppendRaw writes an already-framed record.
@@ -216,19 +354,7 @@ func (l *segment) AppendRaw(raw []byte) (uint64, error) {
 	if err := verifyRecord(raw); err != nil {
 		return 0, err
 	}
-	at := l.offset
-	if _, err := l.f.Write(raw); err != nil {
-		return 0, l.fail(err)
-	}
-	l.offset += uint64(len(raw))
-	l.dirty = true
-	l.writes.Add(1)
-	if Fsync(l.fsync.Load()) == FsyncAlways {
-		if err := l.syncLocked(); err != nil {
-			return 0, err
-		}
-	}
-	return at, nil
+	return l.stageLocked(raw)
 }
 
 // Offset is the stream offset just past the last record written. A snapshot
@@ -250,6 +376,12 @@ func (l *segment) Sync() error {
 func (l *segment) syncLocked() error {
 	if l.err != nil {
 		return l.err
+	}
+	// Anything still staged is written first. A sync that forced only what
+	// had already reached the file would report durability for a batch that
+	// is still in memory, which is the one thing fsync is asked for.
+	if err := l.drainLocked(); err != nil {
+		return err
 	}
 	if !l.dirty {
 		return nil
@@ -319,9 +451,9 @@ func (l *segment) fail(err error) error {
 func (l *segment) TruncateTo(off uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if off > l.offset {
+	if off > l.assigned {
 		return fmt.Errorf("persist: cannot truncate %s to offset %d, past its end %d",
-			l.path, off, l.offset)
+			l.path, off, l.assigned)
 	}
 	base, err := l.baseLocked()
 	if err != nil {
@@ -331,6 +463,11 @@ func (l *segment) TruncateTo(off uint64) error {
 		return fmt.Errorf("persist: cannot truncate %s to offset %d, before its first record %d",
 			l.path, off, base)
 	}
+	// Staged records are discarded rather than written: recovery is cutting
+	// the log back to a known-good point, and anything queued behind that
+	// point is what it is cutting away.
+	l.pending = nil
+	l.assigned = off
 	size := int64(off-base) + fileHeaderSize
 	if err := l.f.Truncate(size); err != nil {
 		return l.fail(err)

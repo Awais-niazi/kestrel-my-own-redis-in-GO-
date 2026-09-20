@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -402,4 +403,46 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestGroupCommitSharesFsyncsOnARealServer measures the thing issue 7 was
+// about, through the server rather than the log alone: with appendfsync
+// always and many clients, a disk flush must serve more than one write.
+//
+// It asserts a ratio rather than a rate, because a rate is a fact about the
+// disk and the ratio is a fact about the code.
+func TestGroupCommitSharesFsyncsOnARealServer(t *testing.T) {
+	dir := t.TempDir()
+	ts := durableServer(t, dir, func(c *config.Config) {
+		must(t, c.Set("appendfsync", "always"))
+	})
+
+	const writers, each = 16, 60
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			c := ts.connect(t)
+			for i := 0; i < each; i++ {
+				// Keys are spread so the writes do not all queue on one
+				// shard's ordering lock, which would leave a single append
+				// in flight and nothing to batch.
+				c.do("SET", fmt.Sprintf("w%d-k%d", w, i), "value")
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	st := ts.persist.log.Stats()
+	if st.Writes < writers*each {
+		t.Fatalf("only %d records reached the log, want at least %d",
+			st.Writes, writers*each)
+	}
+	if st.Syncs >= st.Writes {
+		t.Errorf("%d fsyncs for %d records: every write is paying for its own "+
+			"flush, so group commit is not forming batches", st.Syncs, st.Writes)
+	}
+	t.Logf("%d records reached disk in %d flushes (%.1f per flush)",
+		st.Writes, st.Syncs, float64(st.Writes)/float64(st.Syncs))
 }

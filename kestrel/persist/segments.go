@@ -170,13 +170,22 @@ func adoptLegacyLog(dir string) (bool, error) {
 type Log struct {
 	dir string
 
-	mu   sync.Mutex
+	// mu guards cur and segs. Appends take it shared, because the segment
+	// does its own ordering and batching underneath: holding it exclusively
+	// across an append serialised every writer before they could reach the
+	// batching code at all, and group commit could never form a batch.
+	// Rolling, pruning and closing take it exclusively.
+	mu   sync.RWMutex
 	cur  *segment
 	segs []Segment // every segment, including the one being written
 	// appended is closed and replaced every time a record is written, so a
 	// follower can wait for the next one without polling. A closed channel
 	// is the cheapest broadcast Go has, and unlike a sync.Cond it composes
 	// with a select on a context.
+	//
+	// It has its own mutex because replacing it is exclusive work that
+	// happens on the shared-lock append path.
+	notifyMu sync.Mutex
 	appended chan struct{}
 	closed   bool
 
@@ -228,17 +237,21 @@ func (l *Log) startSegmentLocked(seq int, base uint64) error {
 
 // Append writes one effect and returns the stream offset it was written at.
 func (l *Log) Append(db int, args [][]byte) (uint64, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	at, err := l.cur.Append(db, args)
+	l.mu.RLock()
+	cur := l.cur
+	l.mu.RUnlock()
+
+	at, err := cur.Append(db, args)
 	if err == nil {
-		l.wakeLocked()
+		l.wake()
 	}
 	return at, err
 }
 
-// wakeLocked releases every follower waiting for a new record.
-func (l *Log) wakeLocked() {
+// wake releases every follower waiting for a new record.
+func (l *Log) wake() {
+	l.notifyMu.Lock()
+	defer l.notifyMu.Unlock()
 	close(l.appended)
 	l.appended = make(chan struct{})
 }
@@ -250,8 +263,8 @@ func (l *Log) wakeLocked() {
 // waiting past. Taking it afterwards would miss a record written in between
 // and the follower would sleep with data available.
 func (l *Log) Appended() <-chan struct{} {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.notifyMu.Lock()
+	defer l.notifyMu.Unlock()
 	return l.appended
 }
 
@@ -259,15 +272,15 @@ func (l *Log) Appended() <-chan struct{} {
 // before it was in a segment that compaction unlinked, so a replica asking
 // for it needs a full resynchronisation rather than a partial one.
 func (l *Log) OldestOffset() uint64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.segs[0].Base
 }
 
 // Offset is the stream offset just past the last record written.
 func (l *Log) Offset() uint64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.cur.Offset()
 }
 
@@ -282,7 +295,7 @@ func (l *Log) Roll() error {
 
 	at := l.cur.Offset()
 	seq := l.segs[len(l.segs)-1].Seq + 1
-	defer l.wakeLocked()
+	defer l.wake()
 	if err := l.cur.Sync(); err != nil {
 		return err
 	}
@@ -346,11 +359,13 @@ func (l *Log) Prune(below uint64) (removed int, freed int64, err error) {
 // offsets. That is what lets a restarted replica quote a position its leader
 // recognises without any translation.
 func (l *Log) AppendRaw(raw []byte) (uint64, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	at, err := l.cur.AppendRaw(raw)
+	l.mu.RLock()
+	cur := l.cur
+	l.mu.RUnlock()
+
+	at, err := cur.AppendRaw(raw)
 	if err == nil {
-		l.wakeLocked()
+		l.wake()
 	}
 	return at, err
 }
@@ -381,8 +396,8 @@ func (l *Log) Reset(base uint64) error {
 
 // Segments returns the segments the log currently spans.
 func (l *Log) Segments() []Segment {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	out := make([]Segment, len(l.segs))
 	copy(out, l.segs)
 	out[len(out)-1].End = l.cur.Offset()
@@ -391,16 +406,16 @@ func (l *Log) Segments() []Segment {
 
 // Sync forces the current segment.
 func (l *Log) Sync() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.cur.Sync()
 }
 
 // SetFsync changes the durability policy.
 func (l *Log) SetFsync(f Fsync) {
 	l.fsync.Store(int32(f))
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	l.cur.SetFsync(f)
 }
 
@@ -409,8 +424,8 @@ func (l *Log) Fsync() Fsync { return Fsync(l.fsync.Load()) }
 
 // Err reports the first write or fsync failure.
 func (l *Log) Err() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.cur.Err()
 }
 
@@ -422,15 +437,15 @@ func (l *Log) Close() error {
 		l.closed = true
 		// Followers are woken so they observe the close rather than
 		// blocking until a record that will never come.
-		l.wakeLocked()
+		l.wake()
 	}
 	return l.cur.Close()
 }
 
 // Closed reports whether the log has been closed.
 func (l *Log) Closed() bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.closed
 }
 
@@ -441,11 +456,11 @@ func (l *Log) Dir() string { return l.dir }
 // what an operator watching disk use wants, and what the growth-based
 // compaction trigger compares against.
 func (l *Log) Stats() Stats {
-	l.mu.Lock()
+	l.mu.RLock()
 	cur := l.cur
 	segs := make([]Segment, len(l.segs))
 	copy(segs, l.segs)
-	l.mu.Unlock()
+	l.mu.RUnlock()
 
 	s := cur.Stats()
 	s.Segments = len(segs)

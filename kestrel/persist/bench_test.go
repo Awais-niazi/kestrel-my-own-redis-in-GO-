@@ -54,3 +54,21 @@ func BenchmarkEncodeRecord(b *testing.B) {
 		buf = encodeRecord(buf[:0], 0, KindEffect, args)
 	}
 }
+
+// BenchmarkAppendParallelAlways is the case group commit exists for: many
+// clients writing with appendfsync always, where one disk flush per command
+// is the four orders of magnitude issue 7 measured. Batching lets a flush
+// serve every append that arrived while it was in progress.
+func BenchmarkAppendParallelAlways(b *testing.B) {
+	l := benchLog(b, FsyncAlways)
+	args := cmd("SET", "somekey", "somevalue")
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := l.Append(0, args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
