@@ -1570,3 +1570,109 @@ correctly and freed never.
 `DBSIZE`, `KEYS`, `SCAN` and `RANDOMKEY` already filtered expired keys
 without reaping them, so they needed no change -- they had been written
 against the hiding rule all along.
+
+---
+
+## 27. The custom dictionary, and three measurements that changed it
+
+Issue 5 said the custom hash table should be scheduled immediately after GA,
+because it resolves ADR-004's rehash-pause risk, the `SCAN` deviation and
+the pointer-density cost in one project rather than three. Two of those
+turned out to be real. The third was wrong, and measurement is what said so.
+
+### The cursor dictates the structure
+
+The reference `SCAN` cursor works because growing a table from 2^k to
+2^(k+1) buckets splits each bucket's contents into exactly two -- i and
+i + 2^k, decided by one bit of the hash -- and nothing else moves.
+Reverse-binary increment visits buckets in an order that exploits that: the
+bits deciding where an entry lands after a resize are the ones that change
+last, so a table that doubles or halves between calls cannot move an entry
+from a bucket the cursor has yet to reach into one it has already passed.
+
+Open addressing is denser and kinder to the cache, and destroys the property
+outright, because a probe sequence moves entries to slots the cursor may
+already have visited. **The guarantee chooses the data structure.**
+
+### The pointer-free bucket array cost more than it saved
+
+The first version held an `int32` index per bucket and kept every entry in a
+side array. The bucket array -- the largest thing a shard owns -- then held
+no pointers at all and the collector could skip it, which was the third
+justification in issue 5.
+
+It is also a second dependent load on the way to every key. At a million
+keys in random order:
+
+| | ns/op |
+|---|---|
+| indexed buckets | 755 |
+| Go's map | 725 |
+| inline chain heads | 669 |
+
+So the version built for the GC was slower than the map it was replacing,
+and storing each chain's head inline turned that into about 8% faster. The
+claim has been removed from the design rather than reworded: **an argument
+about the collector lost to a measurement about cache misses.**
+
+### It costs about nineteen bytes a key more than Go's map
+
+Measured directly, two hundred thousand keys, live heap after collection:
+
+| | bytes per key |
+|---|---|
+| Go's map (swiss tables) | 35.0 |
+| this table | 53.7 |
+
+The difference is empty slots. Inline heads mean an empty bucket costs a
+whole 32-byte entry, and power-of-two sizing at a load factor of one leaves
+roughly 37% of them empty. Go's map groups eight slots together and runs at
+a load factor near 7/8, so it wastes far less.
+
+Raising the load factor to two fixes the memory and ruins the point:
+
+| load factor | bytes per key | ns/op at 1M keys |
+|---|---|---|
+| 1 | 53.7 | 669 |
+| 2 | 39.4 | 869 |
+
+At two it is slower than the map it replaces. The table is kept at one.
+**This is the honest price of the cursor**, and it is roughly what the
+reference implementation's own dict costs; Go's map is unusually compact,
+not our table unusually fat.
+
+### The accounting stopped being a guess, and the first attempt made it worse
+
+`objectSize` multiplied a constant -- 48 bytes, an estimate of what Go spends
+on map buckets, which the runtime does not publish -- by the key count.
+Swapping the table in, the obvious move was to derive a new constant from
+the new layout: 32 bytes a slot times about 1.37 slots a key, so 43.
+
+That shipped an estimate that was *lower* than the old one for a table that
+actually uses *more* memory, which is the dangerous direction: `maxmemory` is
+enforced against this number. A real server showed it plainly -- the estimate
+said the new build used less, and its resident set was twenty megabytes
+larger.
+
+The table knows its own size, so there is no need to amortise anything.
+`objectSize` now covers only the key bytes, the object header and the value,
+and `MemoryEstimate` adds each shard's `dict.overhead()` whole. That is
+arithmetic over allocations the table made itself, and it can be checked:
+for two hundred thousand keys the heap grew by 10,739,712 bytes and
+`overhead()` reported 10,739,712. There is a test that keeps it honest.
+
+It is also correct in states a per-key constant cannot describe -- a table
+that is half empty, or midway through a rehash with two tables allocated.
+
+### What it did to the server, which is nothing
+
+End to end, fifty clients, no pipelining: 18.0k SET/s and 18.5k GET/s before,
+18.1k and 18.2k after. At that rate a request takes 55 microseconds and the
+hash table is two hundred nanoseconds of it. Pipelined, where syscalls no
+longer dominate, SET went from ~188k/s to ~211k/s and GET from ~249k/s to
+~238k/s.
+
+**The table does not make the server faster, and was never going to.** The
+engine-level lookup is about 17% quicker; that is 0.4% of a request. The
+speed work was not there to win anything, it was there to make sure the thing
+being adopted for correctness did not cost performance to get it.

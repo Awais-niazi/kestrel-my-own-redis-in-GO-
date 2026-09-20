@@ -212,7 +212,7 @@ func TestActiveExpirePass(t *testing.T) {
 	db.lockAll()
 	var remaining int
 	for _, s := range db.shards {
-		remaining += len(s.dict)
+		remaining += s.dict.len()
 	}
 	db.unlockAll()
 	if remaining != 50 {
@@ -321,8 +321,7 @@ func stillPresent(db *DB, key string) bool {
 	s := db.shardFor([]byte(key))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.dict[key]
-	return ok
+	return s.dict.getString(key) != nil
 }
 
 func TestReplicaHidesButDoesNotDelete(t *testing.T) {
@@ -343,7 +342,7 @@ func TestReplicaHidesButDoesNotDelete(t *testing.T) {
 	}
 	// The leader's DEL is what actually removes it.
 	db.lockAll()
-	present := len(db.shards[db.shardIndex([]byte("k"))].dict)
+	present := db.shards[db.shardIndex([]byte("k"))].dict.len()
 	db.unlockAll()
 	if present != 1 {
 		t.Fatal("replica deleted the key locally")
@@ -649,8 +648,16 @@ func TestMemoryEstimateTracksWrites(t *testing.T) {
 		t.Fatal("MEMORY USAGE reported a missing key")
 	}
 	db.Flush()
-	if got := ks.MemoryEstimate(); got != 0 {
-		t.Fatalf("estimate after flush: %d", got)
+	// Back to what an empty keyspace costs, which is not zero: the hash
+	// tables are allocated and the estimate now counts them rather than
+	// amortising a guess over the keys. A flush replaces them with fresh
+	// ones of the minimum size, so the figure returns exactly to the
+	// starting point.
+	if got := ks.MemoryEstimate(); got != base {
+		t.Fatalf("estimate after flush is %d, want the empty-keyspace cost %d", got, base)
+	}
+	if base <= 0 {
+		t.Errorf("an empty keyspace is reported as costing %d bytes", base)
 	}
 }
 

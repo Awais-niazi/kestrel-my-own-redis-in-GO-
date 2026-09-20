@@ -444,8 +444,10 @@ type shard struct {
 	// mutation and the record of it reaching the log.
 	prop sync.Mutex
 
-	mu   sync.Mutex
-	dict map[string]*Object
+	mu sync.Mutex
+	// dict is the shard's keys. See dict.go for why it is not a Go map: the
+	// SCAN cursor needs an iteration order the runtime does not offer.
+	dict *dict
 	// expires indexes the keys carrying a TTL. It exists so the active
 	// expiry cycle has a small population to sample rather than the whole
 	// dictionary; the authoritative timestamp lives on the Object.
@@ -472,7 +474,7 @@ func newDB(ks *Keyspace, index, n int) *DB {
 	db := &DB{ks: ks, Index: index, shards: make([]*shard, n), mask: uint64(n - 1)}
 	for i := range db.shards {
 		db.shards[i] = &shard{
-			dict:    make(map[string]*Object),
+			dict:    newDict(),
 			expires: make(map[string]struct{}),
 		}
 	}
@@ -608,7 +610,7 @@ func (db *DB) getType(s *shard, key []byte, t ObjectType, a Access) (*Object, er
 // peek returns the live object for key, hiding an expired one without
 // reaping it. The shard must be locked.
 func (db *DB) peek(s *shard, key []byte) *Object {
-	o := s.dict[string(key)] // the compiler elides the string allocation here
+	o := s.dict.get(key)
 	if o == nil {
 		return nil
 	}
@@ -639,7 +641,7 @@ func (db *DB) peekType(s *shard, key []byte, t ObjectType) (*Object, error) {
 // lookup returns the live object for key, reaping it first if it has expired.
 // The shard must be locked and its propagation lock held.
 func (db *DB) lookup(s *shard, key []byte) *Object {
-	o := s.dict[string(key)]
+	o := s.dict.get(key)
 	if o == nil {
 		return nil
 	}
@@ -719,13 +721,13 @@ var delCommand = []byte("DEL")
 // store installs o under key. The shard must be locked. key is copied.
 func (db *DB) store(s *shard, key []byte, o *Object) {
 	k := string(key)
-	if old, ok := s.dict[k]; ok {
+	if old := s.dict.get(key); old != nil {
 		s.memory -= objectSize(k, old)
 		if old.ExpireAt > 0 && o.ExpireAt == 0 {
 			delete(s.expires, k)
 		}
 	}
-	s.dict[k] = o
+	s.dict.set(k, o)
 	if o.ExpireAt > 0 {
 		s.expires[k] = struct{}{}
 	}
@@ -736,12 +738,11 @@ func (db *DB) store(s *shard, key []byte, o *Object) {
 // removeLocked deletes key from the shard. The shard must be locked.
 func (db *DB) removeLocked(s *shard, key string, o *Object) {
 	if o == nil {
-		var ok bool
-		if o, ok = s.dict[key]; !ok {
+		if o = s.dict.getString(key); o == nil {
 			return
 		}
 	}
-	delete(s.dict, key)
+	s.dict.deleteString(key)
 	delete(s.expires, key)
 	s.memory -= objectSize(key, o)
 	s.changes++
@@ -769,9 +770,9 @@ func (db *DB) Size() int64 {
 	now := db.ks.Now()
 	var n int64
 	for _, s := range db.shards {
-		n += int64(len(s.dict))
+		n += int64(s.dict.len())
 		for k := range s.expires {
-			if o := s.dict[k]; o != nil && db.ks.expiredAt(o, now) {
+			if o := s.dict.getString(k); o != nil && db.ks.expiredAt(o, now) {
 				n--
 			}
 		}
@@ -785,7 +786,7 @@ func (db *DB) MemoryEstimate() int64 {
 	db.ks.barrier.RLock()
 	for _, s := range db.shards {
 		s.mu.Lock()
-		n += s.memory
+		n += s.memory + s.dict.overhead()
 		s.mu.Unlock()
 	}
 	db.ks.barrier.RUnlock()
@@ -802,7 +803,7 @@ func (db *DB) Flush() {
 // flushLocked requires the barrier write lock.
 func (db *DB) flushLocked() {
 	for _, s := range db.shards {
-		s.dict = make(map[string]*Object)
+		s.dict = newDict()
 		s.expires = make(map[string]struct{})
 		s.memory = 0
 		s.changes++

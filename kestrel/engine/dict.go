@@ -1,6 +1,10 @@
 package engine
 
-import "math/bits"
+import (
+	"math/bits"
+
+	"github.com/cespare/xxhash/v2"
+)
 
 // dict is the keyspace's hash table: chained buckets, power-of-two sizing,
 // incremental rehash, and a cursor that survives both.
@@ -117,9 +121,10 @@ func newTable(buckets int) table {
 	}
 	return table{
 		heads: h,
-		// Overflow runs at roughly a third of the bucket count at a load
-		// factor of one, by the usual Poisson argument.
-		over: make([]entry, 0, buckets/2),
+		// Overflow is left for append to size. Reserving for it up front
+		// costs the whole reservation whether or not the keys ever arrive,
+		// and a table that is merely sized for a million keys should not
+		// pay for a million keys' worth of chains it does not have.
 		mask: uint32(buckets - 1),
 	}
 }
@@ -156,12 +161,58 @@ func (d *dict) len() int {
 	return n
 }
 
-// get returns the object stored under key, or nil.
+// dictHash is the part of a key's 64-bit hash that the table uses. The low
+// bits choose the shard, so the table takes the high ones: within a shard
+// every key shares the low bits, and a table indexed by them would put
+// everything in one bucket.
+//
+// The shard has already computed this hash to find itself, and computing it
+// again here costs about four nanoseconds of the six hundred a lookup takes
+// at a million keys. Threading the value through instead would touch every
+// accessor in the engine; it is worth doing if it ever shows up in a
+// measurement, and is not worth doing before then.
+func dictHash(key []byte) uint32       { return uint32(xxhash.Sum64(key) >> 32) }
+func dictHashString(key string) uint32 { return uint32(xxhash.Sum64String(key) >> 32) }
+
+// The accessors come in byte-slice and string pairs. Go compares a stored
+// string against either without allocating, but converting one to the other
+// to share a single parameter would allocate on paths that must not.
+
+func (d *dict) get(key []byte) *Object { return d.getHashed(key, dictHash(key)) }
+
+func (d *dict) getString(key string) *Object {
+	hash := dictHashString(key)
+	if v := d.tab[0].lookupString(key, hash); v != nil {
+		return v
+	}
+	if d.rehashing() {
+		return d.tab[1].lookupString(key, hash)
+	}
+	return nil
+}
+
+func (d *dict) set(key string, val *Object) bool {
+	return d.setHashed(key, dictHashString(key), val)
+}
+
+func (d *dict) delete(key []byte) bool { return d.deleteHashed(key, dictHash(key)) }
+
+func (d *dict) deleteString(key string) bool {
+	d.step()
+	hash := dictHashString(key)
+	if d.tab[0].removeString(key, hash) || (d.rehashing() && d.tab[1].removeString(key, hash)) {
+		d.shrinkIfSparse()
+		return true
+	}
+	return false
+}
+
+// getHashed returns the object stored under key, or nil.
 //
 // key is not converted to a string: comparing a string field against
 // string(b) is recognised by the compiler and does not allocate, which is
 // what keeps GET on the zero-allocation path.
-func (d *dict) get(key []byte, hash uint32) *Object {
+func (d *dict) getHashed(key []byte, hash uint32) *Object {
 	// tab[0] always has buckets -- newDict allocates them and the end of a
 	// rehash moves a real table into it -- so the common path needs no
 	// emptiness check and no loop over the two tables. Only a rehash in
@@ -197,11 +248,30 @@ func (t *table) lookup(key []byte, hash uint32) *Object {
 	return nil
 }
 
+// lookupString is lookup for a caller that already holds a string.
+func (t *table) lookupString(key string, hash uint32) *Object {
+	h := &t.heads[hash&t.mask]
+	if h.next == noHead {
+		return nil
+	}
+	if h.hash == hash && h.key == key {
+		return h.val
+	}
+	for e := h.next; e != noEntry; {
+		en := &t.over[e]
+		if en.hash == hash && en.key == key {
+			return en.val
+		}
+		e = en.next
+	}
+	return nil
+}
+
 // set stores val under key, reporting whether the key was new.
 //
 // An existing key keeps its position: the value is replaced where it sits,
 // so a rewrite costs no rehash and cannot move the key past a live cursor.
-func (d *dict) set(key string, hash uint32, val *Object) (added bool) {
+func (d *dict) setHashed(key string, hash uint32, val *Object) (added bool) {
 	d.step()
 
 	if d.tab[0].replace(key, hash, val) {
@@ -256,8 +326,8 @@ func (t *table) insert(key string, hash uint32, val *Object) {
 	t.live++
 }
 
-// delete removes key, reporting whether it was there.
-func (d *dict) delete(key []byte, hash uint32) bool {
+// deleteHashed removes key, reporting whether it was there.
+func (d *dict) deleteHashed(key []byte, hash uint32) bool {
 	d.step()
 
 	if d.tab[0].remove(key, hash) || (d.rehashing() && d.tab[1].remove(key, hash)) {
@@ -267,11 +337,9 @@ func (d *dict) delete(key []byte, hash uint32) bool {
 	return false
 }
 
-// remove unlinks key from t.
-//
-// Deleting the head of a chain promotes the first overflow entry into the
-// bucket rather than leaving an indirection behind, so the fast path stays
-// fast for whatever is left.
+// remove unlinks key from t, and removeString does the same for a caller
+// that already holds a string. Only the comparison differs; both hand the
+// position they found to unlink, which is where the care is.
 func (t *table) remove(key []byte, hash uint32) bool {
 	if len(t.heads) == 0 {
 		return false
@@ -281,36 +349,74 @@ func (t *table) remove(key []byte, hash uint32) bool {
 		return false
 	}
 	if h.hash == hash && h.key == string(key) {
-		if h.next == noEntry {
-			// Cleared rather than merely marked, so the collector is not
-			// left holding the key and its value through an empty bucket.
-			*h = entry{next: noHead}
-		} else {
-			i := h.next
-			*h = t.over[i]
-			t.dropOverflow(i)
-		}
-		t.live--
+		t.unlinkHead(h)
 		return true
 	}
-
 	prev := h
 	for e := h.next; e != noEntry; {
 		en := &t.over[e]
 		if en.hash == hash && en.key == string(key) {
-			// Unlinked before the arena is compacted, so the repointing walk
-			// below cannot find this entry. prev may itself be the entry
-			// that compaction moves, which is safe because the write happens
-			// first and is carried along by the move.
-			prev.next = en.next
-			t.dropOverflow(e)
-			t.live--
+			t.unlinkOverflow(prev, e)
 			return true
 		}
 		prev = en
 		e = en.next
 	}
 	return false
+}
+
+func (t *table) removeString(key string, hash uint32) bool {
+	if len(t.heads) == 0 {
+		return false
+	}
+	h := &t.heads[hash&t.mask]
+	if h.next == noHead {
+		return false
+	}
+	if h.hash == hash && h.key == key {
+		t.unlinkHead(h)
+		return true
+	}
+	prev := h
+	for e := h.next; e != noEntry; {
+		en := &t.over[e]
+		if en.hash == hash && en.key == key {
+			t.unlinkOverflow(prev, e)
+			return true
+		}
+		prev = en
+		e = en.next
+	}
+	return false
+}
+
+// unlinkHead removes the entry sitting in a bucket.
+//
+// The first overflow entry is promoted into the bucket rather than an
+// indirection being left behind, so the fast path stays fast for whatever
+// is left in the chain.
+func (t *table) unlinkHead(h *entry) {
+	if h.next == noEntry {
+		// Cleared rather than merely marked, so the collector is not left
+		// holding the key and its value through an empty bucket.
+		*h = entry{next: noHead}
+	} else {
+		i := h.next
+		*h = t.over[i]
+		t.dropOverflow(i)
+	}
+	t.live--
+}
+
+// unlinkOverflow removes overflow entry at, whose predecessor is prev.
+func (t *table) unlinkOverflow(prev *entry, at int32) {
+	// Unlinked before the arena is compacted, so the repointing walk inside
+	// dropOverflow cannot find this entry. prev may itself be the entry that
+	// compaction moves, which is safe because the write happens first and is
+	// carried along by the move.
+	prev.next = t.over[at].next
+	t.dropOverflow(at)
+	t.live--
 }
 
 // dropOverflow removes slot i from the overflow arena by moving the last
@@ -414,14 +520,7 @@ func (d *dict) rehashBuckets(n int) bool {
 				break
 			}
 			key, hash, val := h.key, h.hash, h.val
-			if h.next == noEntry {
-				*h = entry{next: noHead}
-			} else {
-				i := h.next
-				*h = src.over[i]
-				src.dropOverflow(i)
-			}
-			src.live--
+			src.unlinkHead(h)
 			d.tab[1].insert(key, hash, val)
 		}
 		d.rehashAt++

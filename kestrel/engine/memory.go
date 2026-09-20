@@ -9,8 +9,16 @@ package engine
 // the real resident cost, which is why the documentation tells operators to
 // set maxmemory to 60-70% of the container limit rather than 90%.
 const (
-	// mapEntryOverhead approximates what one map[string]*Object entry costs
-	// in bucket storage, including the amortized cost of empty slots.
+	// mapEntryOverhead approximates what one Go map entry costs in bucket
+	// storage, including the amortized cost of empty slots. The promoted
+	// hash, set and sorted-set encodings are Go maps, so this stays an
+	// estimate: the runtime does not publish what a bucket costs.
+	//
+	// The keyspace itself is no longer one. Its table reports its own size
+	// exactly (dict.overhead), so it is counted once per shard in
+	// MemoryEstimate rather than amortised over the keys -- which is both
+	// accurate and, unlike a per-key constant, correct while the table is
+	// half empty or midway through a rehash.
 	mapEntryOverhead = 48
 	// objectOverhead is the allocator size class for an Object header.
 	objectOverhead = 48
@@ -21,8 +29,12 @@ const (
 )
 
 // objectSize estimates the bytes attributable to one key/value pair.
+//
+// It covers the key's own bytes, the object header and the value. The hash
+// table slot the key occupies is not included: the table knows its own size
+// and is counted whole, per shard.
 func objectSize(key string, o *Object) int64 {
-	n := int64(mapEntryOverhead + len(key) + objectOverhead)
+	n := int64(len(key) + objectOverhead)
 	if o.ExpireAt > 0 {
 		n += int64(expiresEntryOverhead + len(key))
 	}

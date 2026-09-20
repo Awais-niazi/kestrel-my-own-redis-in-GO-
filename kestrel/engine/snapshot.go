@@ -84,7 +84,8 @@ func (db *DB) SnapshotShard(shard int, anchorAt func() uint64, fn func(*Snapshot
 	defer s.mu.Unlock()
 
 	var e SnapshotEntry
-	for k, o := range s.dict {
+	var walkErr error
+	s.dict.forEach(func(k string, o *Object) bool {
 		e.Key = append(e.Key[:0], k...)
 		e.Type = o.Type
 		e.ExpireAt = o.ExpireAt
@@ -111,13 +112,16 @@ func (db *DB) SnapshotShard(shard int, anchorAt func() uint64, fn func(*Snapshot
 				return true
 			})
 		default:
-			return 0, fmt.Errorf("engine: key %q has unknown type %d", k, o.Type)
+			walkErr = fmt.Errorf("engine: key %q has unknown type %d", k, o.Type)
+			return false
 		}
 		if err := fn(&e); err != nil {
-			return anchor, err
+			walkErr = err
+			return false
 		}
-	}
-	return anchor, nil
+		return true
+	})
+	return anchor, walkErr
 }
 
 // ShardIndexOf reports which shard a key belongs to. Recovery uses it to

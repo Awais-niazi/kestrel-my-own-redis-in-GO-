@@ -248,7 +248,7 @@ func TestAccessClockIsOnlyMaintainedWhenNeeded(t *testing.T) {
 
 	s := db.shardFor([]byte("k"))
 	s.mu.Lock()
-	lru := s.dict["k"].LRU
+	lru := s.dict.getString("k").LRU
 	s.mu.Unlock()
 	if lru != 0 {
 		t.Errorf("the access clock was written under a random policy: %d", lru)
@@ -257,7 +257,7 @@ func TestAccessClockIsOnlyMaintainedWhenNeeded(t *testing.T) {
 	ks.SetEviction(EvictAllKeysLRU, 1<<30, 5)
 	db.Get([]byte("k"))
 	s.mu.Lock()
-	lru = s.dict["k"].LRU
+	lru = s.dict.getString("k").LRU
 	s.mu.Unlock()
 	if lru == 0 {
 		t.Error("the access clock was not written under an LRU policy")

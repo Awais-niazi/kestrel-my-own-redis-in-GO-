@@ -3,27 +3,16 @@ package engine
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sort"
 	"testing"
 
 	"github.com/cespare/xxhash/v2"
 )
 
-// testHash mirrors what the keyspace will use: the low 32 bits of the key
-// hash choose the shard, the high 32 the bucket inside it.
-func testHash(key string) uint32 { return uint32(xxhash.Sum64String(key) >> 32) }
-
-func dictSet(d *dict, key string, val *Object) bool {
-	return d.set(key, testHash(key), val)
-}
-
-func dictGet(d *dict, key string) *Object {
-	return d.get([]byte(key), testHash(key))
-}
-
-func dictDel(d *dict, key string) bool {
-	return d.delete([]byte(key), testHash(key))
-}
+func dictSet(d *dict, key string, val *Object) bool { return d.set(key, val) }
+func dictGet(d *dict, key string) *Object           { return d.get([]byte(key)) }
+func dictDel(d *dict, key string) bool              { return d.delete([]byte(key)) }
 
 func obj(s string) *Object { return &Object{Type: TypeString, Value: []byte(s)} }
 
@@ -159,18 +148,18 @@ func TestDictSurvivesTotalHashCollision(t *testing.T) {
 	keys := make([]string, 200)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("k%d", i)
-		d.set(keys[i], 0, obj(keys[i]))
+		d.setHashed(keys[i], 0, obj(keys[i]))
 	}
 	if d.len() != len(keys) {
 		t.Fatalf("holds %d keys, want %d", d.len(), len(keys))
 	}
 	for _, k := range keys {
-		if got := d.get([]byte(k), 0); got == nil {
+		if got := d.getHashed([]byte(k), 0); got == nil {
 			t.Fatalf("%q is missing from a fully collided table", k)
 		}
 	}
 	for i, k := range keys {
-		if !d.delete([]byte(k), 0) {
+		if !d.deleteHashed([]byte(k), 0) {
 			t.Fatalf("%q would not delete", k)
 		}
 		if got, want := d.len(), len(keys)-i-1; got != want {
@@ -626,16 +615,15 @@ func BenchmarkDictGet(b *testing.B) {
 	keys := benchKeys(n)
 	d := newDict()
 	for _, k := range keys {
-		d.set(string(k), uint32(xxhash.Sum64(k)>>32), obj("v"))
+		d.set(string(k), obj("v"))
 	}
 	order := rand.New(rand.NewSource(1)).Perm(n)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		k := keys[order[i%n]]
-		h := xxhash.Sum64(k)
-		_ = h & 15 // the shard index, as the keyspace would take it
-		if d.get(k, uint32(h>>32)) == nil {
+		_ = xxhash.Sum64(k) & 15 // the shard index, as the keyspace takes it
+		if d.get(k) == nil {
 			b.Fatal("missing key")
 		}
 	}
@@ -663,10 +651,8 @@ func BenchmarkMapGet(b *testing.B) {
 
 func BenchmarkDictSet(b *testing.B) {
 	keys := benchKeys(1000)
-	hashes := make([]uint32, len(keys))
 	strs := make([]string, len(keys))
 	for i, k := range keys {
-		hashes[i] = uint32(xxhash.Sum64(k) >> 32)
 		strs[i] = string(k)
 	}
 	d := newDict()
@@ -674,8 +660,7 @@ func BenchmarkDictSet(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		j := i % len(keys)
-		d.set(strs[j], hashes[j], o)
+		d.set(strs[i%len(strs)], o)
 	}
 }
 
@@ -686,7 +671,7 @@ func BenchmarkDictScanFullIteration(b *testing.B) {
 	const n = 100000
 	d := newDict()
 	for _, k := range benchKeys(n) {
-		d.set(string(k), uint32(xxhash.Sum64(k)>>32), obj("v"))
+		d.set(string(k), obj("v"))
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -713,7 +698,7 @@ func BenchmarkDictGetBigger(b *testing.B) {
 	keys := benchKeys(n)
 	d := newDict()
 	for _, k := range keys {
-		d.set(string(k), uint32(xxhash.Sum64(k)>>32), obj("v"))
+		d.set(string(k), obj("v"))
 	}
 	for d.rehashing() {
 		d.rehashSome(256)
@@ -723,9 +708,8 @@ func BenchmarkDictGetBigger(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		k := keys[order[i%n]]
-		h := xxhash.Sum64(k)
-		_ = h & 15
-		if d.get(k, uint32(h>>32)) == nil {
+		_ = xxhash.Sum64(k) & 15
+		if d.get(k) == nil {
 			b.Fatal("missing key")
 		}
 	}
@@ -749,4 +733,57 @@ func BenchmarkMapGetBigger(b *testing.B) {
 			b.Fatal("missing key")
 		}
 	}
+}
+
+// TestDictOverheadIsWhatTheHeapSays checks the claim that the table reports
+// its own size exactly, which is what MemoryEstimate relies on.
+//
+// The old estimate multiplied a constant by the key count, and the constant
+// was a guess at what Go's map spent on buckets -- a number the runtime does
+// not publish. This one is arithmetic over allocations the table made
+// itself, so it can be checked against the heap, and is worth checking
+// because maxmemory is enforced against it.
+func TestDictOverheadIsWhatTheHeapSays(t *testing.T) {
+	if testing.Short() {
+		t.Skip("forces two collections and reads MemStats")
+	}
+	const n = 200000
+	keys := make([]string, n)
+	objs := make([]*Object, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key:%012d", i)
+		objs[i] = &Object{Type: TypeString, Value: []byte("value-payload-xx")}
+	}
+
+	base := liveHeapBytes()
+	d := newDict()
+	for i := range keys {
+		d.set(keys[i], objs[i])
+	}
+	for d.rehashing() {
+		d.rehashSome(256)
+	}
+	measured := int64(liveHeapBytes() - base)
+	reported := d.overhead()
+	runtime.KeepAlive(d)
+	runtime.KeepAlive(keys)
+	runtime.KeepAlive(objs)
+
+	t.Logf("%d keys: heap grew by %d bytes (%.1f per key), overhead() reports %d",
+		n, measured, float64(measured)/n, reported)
+
+	// A slice header or two of slack is expected; anything more means the
+	// table is spending memory it does not know about.
+	if diff := measured - reported; diff < -4096 || diff > 4096 {
+		t.Errorf("overhead() reports %d bytes but the heap grew by %d, a difference of %d",
+			reported, measured, diff)
+	}
+}
+
+func liveHeapBytes() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
 }
