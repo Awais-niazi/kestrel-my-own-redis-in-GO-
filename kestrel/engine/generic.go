@@ -1,6 +1,9 @@
 package engine
 
-import "math/rand"
+import (
+	"math/bits"
+	"math/rand"
+)
 
 // Del removes keys and returns how many existed.
 func (db *DB) Del(keys [][]byte) int64 {
@@ -188,10 +191,15 @@ func (db *DB) Keys(pattern []byte) [][]byte {
 	return out
 }
 
+// maxScanBuckets caps how many buckets one SCAN call may walk when COUNT is
+// large enough that ten times it would overflow. A cursor that came back
+// unchanged would leave a client looping forever.
+const maxScanBuckets = 1 << 40
+
 // ScanOptions filters a SCAN.
 type ScanOptions struct {
 	Match []byte     // glob pattern, nil for everything
-	Count int        // lower bound on keys returned per call
+	Count int        // approximate upper bound on keys returned per call
 	Type  ObjectType // filter by type when TypeFilter is set
 	// TypeFilter enables the Type filter. A zero ObjectType is a valid type
 	// (string), so the filter needs its own flag.
@@ -200,56 +208,78 @@ type ScanOptions struct {
 
 // Scan iterates the keyspace incrementally.
 //
-// The cursor is a shard index: each call drains whole shards until it has
-// produced at least Count keys, and returns the index of the next shard, or
-// 0 when the iteration is complete.
+// The cursor packs two things. Its low bits are the shard being walked --
+// there are always a power of two of them, which config validates -- and the
+// rest is that shard's own bucket cursor. A shard is walked to its end, then
+// the next one starts from zero, and a cursor of zero means the iteration is
+// complete.
 //
-// This is a documented deviation from the reference implementation, which
-// uses a reverse-binary cursor over its own hash table. Go's built-in map
-// exposes no stable iteration order, so that cursor cannot be implemented on
-// top of it (ADR-004, Q2). The guarantee this design gives is in one respect
-// stronger: because each shard is drained under its own lock, a key present
-// for the whole iteration is returned exactly once. The cost is that COUNT
-// bounds the reply from below rather than above, so a reply can be as large
-// as one shard.
+// Composing them this way is sound because a key cannot change shards: the
+// shard is chosen by its hash and the count is fixed for the life of the
+// process. So the reverse-binary guarantee, which holds within one table
+// (see dict.scan), holds across the whole walk.
+//
+// What this promises is exactly what the reference implementation promises.
+// A key present for the entire iteration is returned at least once, however
+// many times the tables resized underneath the cursor. A key that arrives or
+// leaves midway may or may not appear, and a key already returned may appear
+// again after a resize. Callers must expect duplicates.
+//
+// Count bounds the reply from above rather than below, which is the point of
+// the exercise: the previous cursor was a shard index, so a call drained a
+// whole shard and a reply could carry tens of thousands of keys whatever was
+// asked for. A call now stops as soon as it has Count of them, give or take
+// the tail of the bucket it was in the middle of.
 func (db *DB) Scan(cursor uint64, opts ScanOptions) (uint64, [][]byte) {
 	if opts.Count <= 0 {
 		opts.Count = 10
 	}
 	out := make([][]byte, 0, opts.Count)
-	if cursor >= uint64(len(db.shards)) {
-		return 0, out
+
+	shardBits := bits.TrailingZeros64(uint64(len(db.shards)))
+	idx := int(cursor & db.mask)
+	bucket := cursor >> shardBits
+
+	// A call also stops after a bounded number of buckets, whether or not it
+	// found anything. Without that, a MATCH nothing answers over a large
+	// keyspace would walk all of it in one command and block every other
+	// client for as long as that takes -- the reply would be small and the
+	// pause would not be. The caller sees a short reply and a live cursor,
+	// which is what it is already required to handle.
+	budget := maxScanBuckets
+	if opts.Count < maxScanBuckets/10 {
+		budget = opts.Count * 10
 	}
 
 	db.ks.barrier.RLock()
 	defer db.ks.barrier.RUnlock()
 	now := db.ks.Now()
 
-	i := int(cursor)
-	for ; i < len(db.shards); i++ {
-		s := db.shards[i]
+	for idx < len(db.shards) && len(out) < opts.Count && budget > 0 {
+		s := db.shards[idx]
 		s.mu.Lock()
-		s.dict.forEach(func(k string, o *Object) bool {
+		bucket = s.dict.scan(bucket, func(k string, o *Object) {
 			if db.ks.expiredAt(o, now) {
-				return true
+				return
 			}
 			if opts.TypeFilter && o.Type != opts.Type {
-				return true
+				return
 			}
 			if opts.Match != nil && !MatchPattern(opts.Match, []byte(k)) {
-				return true
+				return
 			}
 			out = append(out, []byte(k))
-			return true
 		})
 		s.mu.Unlock()
-		if len(out) >= opts.Count {
-			i++
-			break
+		budget--
+		if bucket == 0 {
+			// That shard is finished; the next one starts from its first
+			// bucket, which the zero cursor already says.
+			idx++
 		}
 	}
-	if i >= len(db.shards) {
+	if idx >= len(db.shards) {
 		return 0, out
 	}
-	return uint64(i), out
+	return bucket<<shardBits | uint64(idx), out
 }

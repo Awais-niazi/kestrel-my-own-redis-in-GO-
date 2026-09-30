@@ -6,35 +6,43 @@ it is listed here rather than left to be discovered.
 
 ## SCAN cursor semantics
 
-**Deviation.** The cursor is a shard index, not a reverse-binary bucket
-cursor. Each call drains whole shards until it has produced at least `COUNT`
-keys, then returns the next shard index, or `0` when the iteration is done.
+**No longer a deviation.** `SCAN` uses a reverse-binary bucket cursor over
+Kestrel's own hash table, and behaves as the reference implementation does:
+a key present for the whole iteration is returned at least once however many
+times the table resized underneath the cursor, a key that arrives or leaves
+midway may or may not appear, and duplicates are possible. `COUNT` bounds
+the reply from above.
 
-**Why.** Go's built-in map exposes no stable iteration order, so the
-reference cursor cannot be implemented on top of it (ADR-004). Building the
-custom hash table that would allow it is the pre-planned follow-up that
-ADR-004 flags and Q2 asks about.
+Earlier builds could not do this. Go's map exposes no stable iteration
+order, so the reference cursor cannot be built on one (ADR-004), and the
+cursor was a shard index: each call drained a whole shard. That was
+*stronger* in one respect -- a stable key was returned exactly once -- and
+much weaker in the one that matters operationally, because `COUNT` bounded
+the reply from below. On a 126,544-key server, `SCAN 0 COUNT 10` returned
+7,982 keys. It now returns 10.
 
-**What this means in practice.**
+**What remains worth knowing.**
 
-- *Stronger* in one respect: because each shard is drained under its own
-  lock, a key present for the whole iteration is returned **exactly once**,
-  where the reference guarantees only "at least once".
-- *Weaker* in another: `COUNT` bounds the reply from below, not above. A
-  single call can return as many keys as one shard holds, so with 16 shards
-  and 1M keys a reply can carry ~62k keys. Raising `shards` lowers the
-  per-call ceiling.
-- A cursor is meaningful only against the same shard count. Changing
-  `shards` requires a restart anyway.
+- The cursor packs the shard index into its low bits and that shard's bucket
+  cursor into the rest, so it is meaningful only against the same shard
+  count. Changing `shards` requires a restart anyway.
+- A reply can overshoot `COUNT` by the tail of the bucket it stopped in,
+  which is a chain rather than a shard.
+- A call is also bounded by how many buckets it walks, so a `MATCH` that
+  rejects everything returns an empty reply and a live cursor rather than
+  scanning the keyspace in one command. The reference does the same.
 - Total work across a full iteration is O(n), the same as the reference.
 
 ### HSCAN, SSCAN and ZSCAN
 
-These return the whole collection in one call with a zero cursor. That is
-what the reference implementation does for the compact encodings, and this
-implementation extends it to the promoted ones for the same reason as above:
-Go's map exposes no stable iteration order, so a resumable cursor over a
-promoted hash or set cannot be built on it. `COUNT` is accepted and ignored.
+These still return the whole collection in one call with a zero cursor. That
+is what the reference implementation does for the compact encodings, and this
+implementation extends it to the promoted ones, which are Go maps and so have
+no stable iteration order to build a cursor on. `COUNT` is accepted and
+ignored.
+
+Giving the promoted encodings the same table the keyspace now uses would
+close this too, and is the remaining piece of that work.
 
 For a listpack-encoded collection, which is the common case, the behaviour is
 identical to the reference. For a very large hash or set the reply is large,

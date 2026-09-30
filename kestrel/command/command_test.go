@@ -308,10 +308,30 @@ func TestScanCommand(t *testing.T) {
 	s.expectErrPrefix("ERR invalid cursor", "SCAN", "notanumber")
 	s.expectErrPrefix("ERR syntax error", "SCAN", "0", "BOGUS")
 
-	// A TYPE filter that matches nothing yields an empty, terminated scan.
-	v := s.do("SCAN", "0", "TYPE", "list")
-	if str(v) != "[0 []]" {
-		t.Fatalf("SCAN TYPE list = %s", str(v))
+	// A TYPE filter that matches nothing yields nothing, over as many calls
+	// as it takes. It does not terminate in one: a call is bounded by the
+	// buckets it walks as well as by the keys it finds, so a filter that
+	// rejects everything still pages. Draining the whole keyspace in one
+	// command to produce an empty reply is exactly the pause COUNT is
+	// supposed to prevent.
+	cursor, calls := "0", 0
+	for {
+		v := s.do("SCAN", cursor, "TYPE", "list")
+		if got := len(v.Elems[1].Elems); got != 0 {
+			t.Fatalf("SCAN TYPE list returned %d keys, want none", got)
+		}
+		cursor = string(v.Elems[0].Str)
+		calls++
+		if cursor == "0" {
+			break
+		}
+		if calls > 10000 {
+			t.Fatal("SCAN TYPE list did not terminate")
+		}
+	}
+	if calls < 2 {
+		t.Errorf("a filtered scan of 200 keys finished in %d call(s); "+
+			"it cannot have been bounded", calls)
 	}
 }
 

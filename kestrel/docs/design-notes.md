@@ -1676,3 +1676,81 @@ longer dominate, SET went from ~188k/s to ~211k/s and GET from ~249k/s to
 engine-level lookup is about 17% quicker; that is 0.4% of a request. The
 speed work was not there to win anything, it was there to make sure the thing
 being adopted for correctness did not cost performance to get it.
+
+---
+
+## 28. The cursor, and what COUNT now means
+
+Chunks 1 and 2 built the table and put the keyspace on it, at which point
+the project had paid all of its costs -- about nineteen bytes a key -- and
+collected none of its benefit. This is the benefit.
+
+### Composing one cursor out of many tables
+
+The reference implementation has one hash table. Kestrel has a power of two
+of them per database, and a `SCAN` cursor is a single integer the client
+hands back, so the two have to be packed together:
+
+```
+cursor = bucketCursor << shardBits | shardIndex
+```
+
+The low bits name the shard being walked, the rest is that shard's own
+reverse-binary bucket cursor. A shard is walked to its end, the next starts
+from zero, and zero overall means finished.
+
+This is sound because **a key cannot change shards.** The shard is chosen by
+the key's hash and the count is fixed for the life of the process, so the
+reverse-binary guarantee -- which holds within one table across resizes --
+holds across the whole walk. Nothing can migrate from a shard the cursor has
+yet to reach into one it has already passed, because nothing migrates
+between shards at all.
+
+### The trade, made deliberately
+
+The shard-index cursor was *stronger* in one respect: each call drained a
+whole shard under its lock, so a key present throughout was returned exactly
+once, where the reference promises only at least once. That is a real
+property and it has been given up on purpose.
+
+What it cost was the thing an operator actually feels. Measured on a real
+server holding 126,544 keys:
+
+| `SCAN 0 COUNT 10` | keys returned |
+|---|---|
+| shard-index cursor | **7,982** |
+| bucket cursor | **10** |
+
+A client asking for ten keys was handed a shard, and the shard was locked
+for as long as it took to build the reply. At a million keys it would have
+been sixty thousand. **A guarantee nobody asked for was being paid for with
+a pause everybody gets**, and the trade back to the reference's semantics --
+duplicates possible, `COUNT` a ceiling -- is plainly the right way round.
+
+Exactly-once still holds whenever nothing resizes mid-iteration, which is
+the common case; it is simply no longer promised.
+
+### Two ways a call can end
+
+A call stops when it has `COUNT` keys, and also after a bounded number of
+buckets, whichever comes first. The second bound is not obvious and is
+necessary: a `MATCH` that rejects everything produces an empty reply, and
+without a bucket budget it would produce that empty reply *after walking the
+entire keyspace in one command*, blocking every other client for as long as
+that took. The reply would be small; the pause would not be.
+
+So a filtered scan now pages -- empty replies and a live cursor -- which is
+what the reference does and what a correct client already handles. One test
+had to be changed to expect it, because it asserted that `SCAN 0 TYPE list`
+over a keyspace of strings finished in a single call. It used to. That it
+did was the bug.
+
+### Verified against the real thing
+
+`redis-cli --scan` over the 126,544-key server returned 126,544 keys with no
+duplicates, and `--pattern` agreed with `KEYS` exactly. The engine tests
+cover the parts a live server cannot be made to show on demand: that every
+key present throughout comes back when the tables are pushed through a grow
+and a shrink mid-iteration, that a cursor a client invented terminates, and
+that `COUNT` holds at one, four and sixty-four shards -- one shard being the
+case where the cursor has no shard bits at all.

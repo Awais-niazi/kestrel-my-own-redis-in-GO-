@@ -742,3 +742,134 @@ func TestEngineImportGraph(t *testing.T) {
 		}
 	}
 }
+
+// keyspaceWithShards builds a keyspace with a given shard count, so the
+// cursor's packing can be exercised at the edges: one shard means no shard
+// bits at all, and many shards means most of the cursor is the shard index.
+func keyspaceWithShards(t *testing.T, shards int) *Keyspace {
+	t.Helper()
+	opts := DefaultOptions()
+	opts.ActiveExpire = false
+	opts.Shards = shards
+	ks := New(opts)
+	t.Cleanup(ks.Close)
+	return ks
+}
+
+// TestScanCountBoundsTheReplyFromAbove is the reason the custom table was
+// built.
+//
+// The shard-index cursor it replaces drained a whole shard per call, so a
+// client asking for ten keys could be handed every key in the shard --
+// tens of thousands of them on a large keyspace, with the shard locked for
+// the whole of it. COUNT is now a ceiling rather than a floor.
+func TestScanCountBoundsTheReplyFromAbove(t *testing.T) {
+	for _, shards := range []int{1, 4, 64} {
+		ks := keyspaceWithShards(t, shards)
+		db := ks.DB(0)
+		const n = 20000
+		for i := 0; i < n; i++ {
+			mustSet(t, db, fmt.Sprintf("key:%d", i), "v")
+		}
+
+		const count = 10
+		// A bucket's whole chain is emitted once entered, so a reply can
+		// overshoot by the tail of one chain. It cannot overshoot by a
+		// shard, which is what it used to do.
+		const ceiling = count * 4
+
+		var cursor uint64
+		worst, calls := 0, 0
+		for {
+			var keys [][]byte
+			cursor, keys = db.Scan(cursor, ScanOptions{Count: count})
+			if len(keys) > worst {
+				worst = len(keys)
+			}
+			calls++
+			if cursor == 0 || calls > 200000 {
+				break
+			}
+		}
+		if worst > ceiling {
+			t.Errorf("%d shards: the largest reply to COUNT %d held %d keys, want at most %d",
+				shards, count, worst, ceiling)
+		}
+		if calls < n/ceiling {
+			t.Errorf("%d shards: %d calls covered %d keys, which is more per call than asked for",
+				shards, calls, n)
+		}
+	}
+}
+
+// TestScanReturnsEveryKeyThatStaysPut is the reference guarantee, at the
+// keyspace level: keys are written and deleted throughout the iteration,
+// forcing tables to grow and shrink under the cursor, and anything present
+// for the whole walk must come back at least once.
+func TestScanReturnsEveryKeyThatStaysPut(t *testing.T) {
+	ks := keyspaceWithShards(t, 4)
+	db := ks.DB(0)
+	const stable = 2000
+	for i := 0; i < stable; i++ {
+		mustSet(t, db, fmt.Sprintf("stay:%d", i), "v")
+	}
+
+	seen := map[string]bool{}
+	churn, growing := 0, true
+	var cursor uint64
+	for calls := 0; ; calls++ {
+		var keys [][]byte
+		cursor, keys = db.Scan(cursor, ScanOptions{Count: 20})
+		for _, k := range keys {
+			seen[string(k)] = true
+		}
+		if cursor == 0 {
+			break
+		}
+		if calls > 100000 {
+			t.Fatal("the scan did not terminate")
+		}
+		// Push the tables through a grow and then a shrink mid-iteration.
+		if growing {
+			for i := 0; i < 60; i++ {
+				mustSet(t, db, fmt.Sprintf("tmp:%d", churn), "v")
+				churn++
+			}
+			if churn > 12000 {
+				growing = false
+			}
+		} else {
+			for i := 0; i < 60 && churn > 0; i++ {
+				churn--
+				db.Del([][]byte{fmt.Appendf(nil, "tmp:%d", churn)})
+			}
+		}
+	}
+
+	for i := 0; i < stable; i++ {
+		if k := fmt.Sprintf("stay:%d", i); !seen[k] {
+			t.Fatalf("%q was present for the whole scan and was never returned", k)
+		}
+	}
+}
+
+func TestScanTerminatesFromAnyCursor(t *testing.T) {
+	ks := keyspaceWithShards(t, 4)
+	db := ks.DB(0)
+	for i := 0; i < 500; i++ {
+		mustSet(t, db, fmt.Sprintf("key:%d", i), "v")
+	}
+	// A client may send back anything at all; none of it may wedge a scan.
+	for _, start := range []uint64{1, 2, 3, 7, 255, 1 << 31, ^uint64(0)} {
+		cursor := start
+		for calls := 0; ; calls++ {
+			cursor, _ = db.Scan(cursor, ScanOptions{Count: 50})
+			if cursor == 0 {
+				break
+			}
+			if calls > 100000 {
+				t.Fatalf("a scan started at %d did not finish", start)
+			}
+		}
+	}
+}
