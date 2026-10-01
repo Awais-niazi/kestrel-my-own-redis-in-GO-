@@ -24,7 +24,7 @@ type ZMember struct {
 type ZSet struct {
 	lp *listpack // member, score, member, score ... sorted
 	sl *skiplist
-	m  map[string]float64
+	m  *dict[float64]
 }
 
 func newZSet() *ZSet { return &ZSet{lp: newListpack(0)} }
@@ -34,7 +34,7 @@ func (z *ZSet) Len() int {
 	if z.lp != nil {
 		return z.lp.Len() / 2
 	}
-	return len(z.m)
+	return z.m.len()
 }
 
 // Encoding reports the physical representation in use.
@@ -50,10 +50,11 @@ func (z *ZSet) EstimatedSize() int64 {
 	if z.lp != nil {
 		return z.lp.EstimatedSize()
 	}
-	n := z.sl.EstimatedSize() + 48
-	for k := range z.m {
-		n += int64(mapEntryOverhead + len(k) + 8)
-	}
+	n := z.sl.EstimatedSize() + 48 + z.m.overhead()
+	z.m.forEach(func(k string, _ float64) bool {
+		n += int64(len(k))
+		return true
+	})
 	return n
 }
 
@@ -62,10 +63,10 @@ func (z *ZSet) Clone() any {
 	if z.lp != nil {
 		return &ZSet{lp: z.lp.Clone()}
 	}
-	c := &ZSet{sl: newSkiplist(), m: make(map[string]float64, len(z.m))}
+	c := &ZSet{sl: newSkiplist(), m: newDict[float64]()}
 	for x := z.sl.First(); x != nil; x = x.levels[0].next {
 		c.sl.Insert(x.score, x.member)
-		c.m[string(x.member)] = x.score
+		c.m.set(string(x.member), x.score)
 	}
 	return c
 }
@@ -101,7 +102,7 @@ func (z *ZSet) lpSearch(score float64, member []byte) int {
 // Score returns a member's score.
 func (z *ZSet) Score(member []byte) (float64, bool) {
 	if z.lp == nil {
-		s, ok := z.m[string(member)]
+		s, ok := z.m.get(member)
 		return s, ok
 	}
 	i := z.lpFind(member)
@@ -115,7 +116,7 @@ func (z *ZSet) Score(member []byte) (float64, bool) {
 // Add inserts or re-scores a member, reporting whether it was new.
 func (z *ZSet) Add(member []byte, score float64, t *Thresholds) bool {
 	if z.lp == nil {
-		old, existed := z.m[string(member)]
+		old, existed := z.m.get(member)
 		if existed {
 			if old == score {
 				return false
@@ -123,7 +124,7 @@ func (z *ZSet) Add(member []byte, score float64, t *Thresholds) bool {
 			z.sl.Delete(old, member)
 		}
 		z.sl.Insert(score, member)
-		z.m[string(member)] = score
+		z.m.set(string(member), score)
 		return !existed
 	}
 	if i := z.lpFind(member); i >= 0 {
@@ -155,11 +156,11 @@ func (z *ZSet) promoteIfNeeded(t *Thresholds, longest int) {
 		return
 	}
 	sl := newSkiplist()
-	m := make(map[string]float64, z.lp.Len()/2)
+	m := newDict[float64]()
 	for i := 0; i < z.lp.Len()/2; i++ {
 		member, score := z.lpAt(i)
 		sl.Insert(score, member)
-		m[string(member)] = score
+		m.set(string(member), score)
 	}
 	z.sl, z.m, z.lp = sl, m, nil
 }
@@ -167,12 +168,12 @@ func (z *ZSet) promoteIfNeeded(t *Thresholds, longest int) {
 // Remove deletes a member, reporting whether it was present.
 func (z *ZSet) Remove(member []byte) bool {
 	if z.lp == nil {
-		score, ok := z.m[string(member)]
+		score, ok := z.m.get(member)
 		if !ok {
 			return false
 		}
 		z.sl.Delete(score, member)
-		delete(z.m, string(member))
+		z.m.delete(member)
 		return true
 	}
 	i := z.lpFind(member)
@@ -188,7 +189,7 @@ func (z *ZSet) Remove(member []byte) bool {
 func (z *ZSet) Rank(member []byte, reverse bool) (int, bool) {
 	var rank int
 	if z.lp == nil {
-		score, ok := z.m[string(member)]
+		score, ok := z.m.get(member)
 		if !ok {
 			return 0, false
 		}
@@ -380,11 +381,11 @@ func (z *ZSet) checkInvariant() error {
 		}
 		return nil
 	}
-	if z.sl.length != len(z.m) {
+	if z.sl.length != z.m.len() {
 		return errZSetLengthMismatch
 	}
 	for x := z.sl.First(); x != nil; x = x.levels[0].next {
-		score, ok := z.m[string(x.member)]
+		score, ok := z.m.get(x.member)
 		if !ok || score != x.score {
 			return errZSetScoreMismatch
 		}

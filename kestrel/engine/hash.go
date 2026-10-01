@@ -17,8 +17,8 @@ import (
 // place by later writes, and the map path can alias, because a stored value
 // is replaced rather than modified.
 type Hash struct {
-	lp *listpack         // pairs: field, value, field, value
-	m  map[string][]byte // non-nil once promoted
+	lp *listpack     // pairs: field, value, field, value
+	m  *dict[[]byte] // non-nil once promoted
 }
 
 func newHash() *Hash { return &Hash{lp: newListpack(0)} }
@@ -26,7 +26,7 @@ func newHash() *Hash { return &Hash{lp: newListpack(0)} }
 // Len returns the field count.
 func (h *Hash) Len() int {
 	if h.m != nil {
-		return len(h.m)
+		return h.m.len()
 	}
 	return h.lp.Len() / 2
 }
@@ -44,10 +44,11 @@ func (h *Hash) EstimatedSize() int64 {
 	if h.m == nil {
 		return h.lp.EstimatedSize()
 	}
-	n := int64(48)
-	for k, v := range h.m {
-		n += int64(mapEntryOverhead+len(k)+sliceHeaderSize) + int64(cap(v))
-	}
+	n := int64(48) + h.m.overhead()
+	h.m.forEach(func(k string, v []byte) bool {
+		n += int64(len(k) + cap(v))
+		return true
+	})
 	return n
 }
 
@@ -56,18 +57,18 @@ func (h *Hash) Clone() any {
 	if h.m == nil {
 		return &Hash{lp: h.lp.Clone()}
 	}
-	m := make(map[string][]byte, len(h.m))
-	for k, v := range h.m {
-		m[k] = copyBytes(v)
-	}
+	m := newDict[[]byte]()
+	h.m.forEach(func(k string, v []byte) bool {
+		m.set(k, copyBytes(v))
+		return true
+	})
 	return &Hash{m: m}
 }
 
 // Get returns the value of a field.
 func (h *Hash) Get(field []byte) ([]byte, bool) {
 	if h.m != nil {
-		v, ok := h.m[string(field)]
-		return v, ok
+		return h.m.get(field)
 	}
 	i := h.lp.IndexOfStep(field, 2, 0)
 	if i < 0 {
@@ -79,7 +80,7 @@ func (h *Hash) Get(field []byte) ([]byte, bool) {
 // Exists reports whether a field is present, without materializing a value.
 func (h *Hash) Exists(field []byte) bool {
 	if h.m != nil {
-		_, ok := h.m[string(field)]
+		_, ok := h.m.get(field)
 		return ok
 	}
 	return h.lp.IndexOfStep(field, 2, 0) >= 0
@@ -88,7 +89,7 @@ func (h *Hash) Exists(field []byte) bool {
 // ValueLen returns the length of a field's value, without copying it.
 func (h *Hash) ValueLen(field []byte) (int, bool) {
 	if h.m != nil {
-		v, ok := h.m[string(field)]
+		v, ok := h.m.get(field)
 		return len(v), ok
 	}
 	i := h.lp.IndexOfStep(field, 2, 0)
@@ -101,8 +102,8 @@ func (h *Hash) ValueLen(field []byte) (int, bool) {
 // Set writes a field and reports whether it was newly created.
 func (h *Hash) Set(field, value []byte, t *Thresholds) bool {
 	if h.m != nil {
-		_, existed := h.m[string(field)]
-		h.m[string(field)] = copyBytes(value)
+		_, existed := h.m.get(field)
+		h.m.set(string(field), copyBytes(value))
 		return !existed
 	}
 	if i := h.lp.IndexOfStep(field, 2, 0); i >= 0 {
@@ -118,10 +119,10 @@ func (h *Hash) Set(field, value []byte, t *Thresholds) bool {
 // Delete removes a field and reports whether it was present.
 func (h *Hash) Delete(field []byte) bool {
 	if h.m != nil {
-		if _, ok := h.m[string(field)]; !ok {
+		if _, ok := h.m.get(field); !ok {
 			return false
 		}
-		delete(h.m, string(field))
+		h.m.delete(field)
 		return true
 	}
 	i := h.lp.IndexOfStep(field, 2, 0)
@@ -140,13 +141,13 @@ func (h *Hash) promoteIfNeeded(t *Thresholds, longest int) {
 	if h.lp.Len()/2 <= t.HashMaxListpackEntries && longest <= t.HashMaxListpackValue {
 		return
 	}
-	m := make(map[string][]byte, h.lp.Len()/2)
+	m := newDict[[]byte]()
 	var field []byte
 	h.lp.Each(func(i int, e []byte) bool {
 		if i%2 == 0 {
 			field = copyBytes(e)
 		} else {
-			m[string(field)] = copyBytes(e)
+			m.set(string(field), copyBytes(e))
 		}
 		return true
 	})
@@ -172,14 +173,15 @@ func (h *Hash) collect(fields, values bool) [][]byte {
 	}
 	out := make([][]byte, 0, h.Len()*per)
 	if h.m != nil {
-		for k, v := range h.m {
+		h.m.forEach(func(k string, v []byte) bool {
 			if fields {
 				out = append(out, []byte(k))
 			}
 			if values {
 				out = append(out, v)
 			}
-		}
+			return true
+		})
 		return out
 	}
 	h.lp.Each(func(i int, e []byte) bool {

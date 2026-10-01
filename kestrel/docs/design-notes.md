@@ -1815,3 +1815,60 @@ would still make progress, because what they sample they then remove. They
 would re-examine keys rather than fail to reach them.
 
 **Tidiness is not a reason to spend memory in a data store.**
+
+---
+
+## 30. The collections get the same table, and the table gets a type parameter
+
+`SCAN` was fixed in issue 28. `HSCAN`, `SSCAN` and `ZSCAN` were not, and
+they had the identical defect: a promoted collection answered with the whole
+of itself whatever `COUNT` said. Measured on a fifty-thousand-field hash:
+
+| `HSCAN h 0 COUNT 10 NOVALUES` | fields returned | cursor |
+|---|---|---|
+| before | **34,639** | `0` |
+| after | **10** | `2048` |
+
+The old reply was not merely large, it was *wrong about being finished* --
+it returned a terminating cursor, so a well-behaved client had no way to ask
+for less.
+
+Below the configured thresholds a collection is a listpack or an intset and
+still comes back whole with a zero cursor. That is what the reference does
+for its compact encodings, and the encoding is bounded by configuration, so
+the reply is bounded with it.
+
+### Generics, reluctantly, and then gladly
+
+The promoted encodings are three different maps -- `map[string][]byte`,
+`map[string]struct{}`, `map[string]float64` -- so giving them the keyspace's
+table meant the table had to carry something other than `*Object`. The
+options were a type parameter, three hand-written copies, or boxing every
+value in an interface.
+
+The worry about a type parameter was the hot path: `dict[*Object]` is the
+keyspace, and GET is the one operation this project treats as sacred. It
+cost nothing. `BenchmarkEngineGet` runs at a median of 185ns against 202ns
+before, which is to say within the noise of a loaded machine, and GET still
+allocates nothing.
+
+One real change came with it. `get` returned `*Object` and used nil for
+"absent", which a type parameter cannot do -- `float64` and `struct{}` have
+no nil. The lookup family now reports presence separately, as
+`(V, bool)`, which is better anyway: the old signature conflated "no such
+key" with "a key holding nil", and only a comment stopped that mattering.
+
+### A flaky test that had always been flaky
+
+Converting the sets shifted how much randomness the package consumed, and
+`TestLFUCounterRisesAndDecays` started failing. It asserted that a new key's
+LFU counter is exactly 5.
+
+It is 5, and then incremented with probability 1/51, because the LFU counter
+rises probabilistically. The test had roughly a 2% chance of failing on
+every run it had ever made, and nothing about the change caused it -- the
+change only moved the dice. Fixed by asserting what the code actually
+promises.
+
+**A test that depends on a random draw it does not control is not testing
+the thing it names.**

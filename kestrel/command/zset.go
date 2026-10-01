@@ -797,21 +797,14 @@ func cmdZRandMember(c *Ctx) resp.Value {
 }
 
 func cmdZScan(c *Ctx) resp.Value {
-	_, opts, reply, ok := parseScanArgs(c, 3, false)
+	cursor, opts, reply, ok := parseScanArgs(c, 3, false)
 	if !ok {
 		return reply
 	}
-	members, err := c.DB().ZRange(c.Arg(1),
-		engine.ZRangeSpec{By: engine.RangeByRank, Start: 0, Stop: -1, Count: -1})
+	next, out, err := c.DB().ZScan(c.Arg(1), cursor,
+		engine.CollectionScan{Match: opts.Match, Count: opts.Count})
 	if err != nil {
 		return engineError(err)
 	}
-	out := make([]resp.Value, 0, len(members)*2)
-	for _, m := range members {
-		if opts.Match != nil && !engine.MatchPattern(opts.Match, m.Member) {
-			continue
-		}
-		out = append(out, resp.Bulk(m.Member), resp.Bulk(engine.FormatFloat(m.Score)))
-	}
-	return resp.Array(resp.BulkString("0"), resp.ArrayOf(out))
+	return scanReply(next, out)
 }

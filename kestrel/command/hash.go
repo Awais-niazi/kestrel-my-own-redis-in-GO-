@@ -307,20 +307,10 @@ func cmdHScan(c *Ctx) resp.Value {
 	if !ok {
 		return reply
 	}
-	_ = cursor
-	out, err := c.DB().HRead(c.Arg(1), engine.HashAll)
+	next, out, err := c.DB().HScan(c.Arg(1), cursor,
+		engine.CollectionScan{Match: opts.Match, Count: opts.Count}, opts.NoValues)
 	if err != nil {
 		return engineError(err)
 	}
-	entries := make([]resp.Value, 0, len(out))
-	for i := 0; i+1 < len(out); i += 2 {
-		if opts.Match != nil && !engine.MatchPattern(opts.Match, out[i]) {
-			continue
-		}
-		entries = append(entries, resp.Bulk(out[i]))
-		if !opts.NoValues {
-			entries = append(entries, resp.Bulk(out[i+1]))
-		}
-	}
-	return resp.Array(resp.BulkString("0"), resp.ArrayOf(entries))
+	return scanReply(next, out)
 }

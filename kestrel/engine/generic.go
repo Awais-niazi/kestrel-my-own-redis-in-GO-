@@ -191,11 +191,6 @@ func (db *DB) Keys(pattern []byte) [][]byte {
 	return out
 }
 
-// maxScanBuckets caps how many buckets one SCAN call may walk when COUNT is
-// large enough that ten times it would overflow. A cursor that came back
-// unchanged would leave a client looping forever.
-const maxScanBuckets = 1 << 40
-
 // ScanOptions filters a SCAN.
 type ScanOptions struct {
 	Match []byte     // glob pattern, nil for everything
@@ -246,10 +241,7 @@ func (db *DB) Scan(cursor uint64, opts ScanOptions) (uint64, [][]byte) {
 	// client for as long as that takes -- the reply would be small and the
 	// pause would not be. The caller sees a short reply and a live cursor,
 	// which is what it is already required to handle.
-	budget := maxScanBuckets
-	if opts.Count < maxScanBuckets/10 {
-		budget = opts.Count * 10
-	}
+	budget := scanBudget(opts.Count)
 
 	db.ks.barrier.RLock()
 	defer db.ks.barrier.RUnlock()

@@ -213,9 +213,14 @@ func TestEvictionCountsAreReported(t *testing.T) {
 // TestLFUCounterRisesAndDecays covers the packed counter directly, because
 // its behaviour is not observable from the outside in a short test.
 func TestLFUCounterRisesAndDecays(t *testing.T) {
+	// A new key starts at the initial value, which the same call may then
+	// raise by one: the increment is probabilistic, and at a counter of 5
+	// it fires about one time in fifty-one. Asserting exactly 5 made this
+	// test fail roughly 2% of the time, for a reason that had nothing to do
+	// with whatever change happened to shift the random sequence.
 	v := lfuTouch(0, 100)
-	if c := lfuCounter(v); c != 5 {
-		t.Errorf("a new key starts at %d, want 5 so it is not evicted immediately", c)
+	if c := lfuCounter(v); c != 5 && c != 6 {
+		t.Errorf("a new key starts at %d, want 5 or 6 so it is not evicted immediately", c)
 	}
 	if m := lfuMinute(v); m != 100 {
 		t.Errorf("the decay minute is %d, want 100", m)
@@ -248,7 +253,8 @@ func TestAccessClockIsOnlyMaintainedWhenNeeded(t *testing.T) {
 
 	s := db.shardFor([]byte("k"))
 	s.mu.Lock()
-	lru := s.dict.getString("k").LRU
+	o, _ := s.dict.getString("k")
+	lru := o.LRU
 	s.mu.Unlock()
 	if lru != 0 {
 		t.Errorf("the access clock was written under a random policy: %d", lru)
@@ -257,7 +263,8 @@ func TestAccessClockIsOnlyMaintainedWhenNeeded(t *testing.T) {
 	ks.SetEviction(EvictAllKeysLRU, 1<<30, 5)
 	db.Get([]byte("k"))
 	s.mu.Lock()
-	lru = s.dict.getString("k").LRU
+	o, _ = s.dict.getString("k")
+	lru = o.LRU
 	s.mu.Unlock()
 	if lru == 0 {
 		t.Error("the access clock was not written under an LRU policy")

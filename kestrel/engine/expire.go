@@ -291,8 +291,8 @@ func (db *DB) expireSample(s *shard, n int) (checked, expired int) {
 	// Go randomizes the starting bucket of a map range, which is exactly the
 	// sampling property this needs.
 	for k := range s.expires {
-		o := s.dict.getString(k)
-		if o == nil {
+		o, ok := s.dict.getString(k)
+		if !ok {
 			// Index entry for a key deleted by other means; drop it.
 			delete(s.expires, k)
 			continue

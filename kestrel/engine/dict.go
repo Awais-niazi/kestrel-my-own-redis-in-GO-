@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math/bits"
+	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -88,7 +89,7 @@ const (
 
 // entry is one key: 32 bytes holding the hash, the chain link, and the key
 // and value themselves.
-type entry struct {
+type entry[V any] struct {
 	// hash is the high 32 bits of the key's 64-bit hash. The low bits pick
 	// the shard, so the two uses never share bits and a key's position in
 	// its shard is independent of which shard it landed in.
@@ -97,29 +98,29 @@ type entry struct {
 	// noEntry / noHead.
 	next int32
 	key  string
-	val  *Object
+	val  V
 }
 
 // table is one hash table. A dict holds two of them while rehashing.
-type table struct {
+type table[V any] struct {
 	// heads holds the first entry of every bucket, inline.
-	heads []entry
+	heads []entry[V]
 	// over holds every entry after the first. It is kept dense: removing one
 	// moves the last into its place, so len(over) is exactly the overflow
 	// count and the arena never accumulates holes.
-	over []entry
+	over []entry[V]
 	mask uint32
 	// live is the number of keys, which heads cannot supply because it has
 	// gaps.
 	live int
 }
 
-func newTable(buckets int) table {
-	h := make([]entry, buckets)
+func newTable[V any](buckets int) table[V] {
+	h := make([]entry[V], buckets)
 	for i := range h {
 		h[i].next = noHead
 	}
-	return table{
+	return table[V]{
 		heads: h,
 		// Overflow is left for append to size. Reserving for it up front
 		// costs the whole reservation whether or not the keys ever arrive,
@@ -129,31 +130,31 @@ func newTable(buckets int) table {
 	}
 }
 
-func (t *table) size() int { return len(t.heads) }
-func (t *table) used() int { return t.live }
+func (t *table[V]) size() int { return len(t.heads) }
+func (t *table[V]) used() int { return t.live }
 
 // bucketOf is where a hash belongs in this table.
-func (t *table) bucketOf(hash uint32) uint32 { return hash & t.mask }
+func (t *table[V]) bucketOf(hash uint32) uint32 { return hash & t.mask }
 
 // dict is a hash table with an incremental rehash.
-type dict struct {
+type dict[V any] struct {
 	// tab[0] is the live table. tab[1] exists only while rehashing and is
 	// where new keys go; lookups consult both.
-	tab [2]table
+	tab [2]table[V]
 	// rehashAt is the next bucket of tab[0] to migrate, or -1 when idle.
 	rehashAt int
 }
 
-func newDict() *dict {
-	d := &dict{rehashAt: -1}
-	d.tab[0] = newTable(dictMinBuckets)
+func newDict[V any]() *dict[V] {
+	d := &dict[V]{rehashAt: -1}
+	d.tab[0] = newTable[V](dictMinBuckets)
 	return d
 }
 
-func (d *dict) rehashing() bool { return d.rehashAt >= 0 }
+func (d *dict[V]) rehashing() bool { return d.rehashAt >= 0 }
 
 // len is the number of live keys.
-func (d *dict) len() int {
+func (d *dict[V]) len() int {
 	n := d.tab[0].live
 	if d.rehashing() {
 		n += d.tab[1].live
@@ -178,26 +179,27 @@ func dictHashString(key string) uint32 { return uint32(xxhash.Sum64String(key) >
 // string against either without allocating, but converting one to the other
 // to share a single parameter would allocate on paths that must not.
 
-func (d *dict) get(key []byte) *Object { return d.getHashed(key, dictHash(key)) }
+func (d *dict[V]) get(key []byte) (V, bool) { return d.getHashed(key, dictHash(key)) }
 
-func (d *dict) getString(key string) *Object {
+func (d *dict[V]) getString(key string) (V, bool) {
 	hash := dictHashString(key)
-	if v := d.tab[0].lookupString(key, hash); v != nil {
-		return v
+	if v, ok := d.tab[0].lookupString(key, hash); ok {
+		return v, true
 	}
 	if d.rehashing() {
 		return d.tab[1].lookupString(key, hash)
 	}
-	return nil
+	var zero V
+	return zero, false
 }
 
-func (d *dict) set(key string, val *Object) bool {
+func (d *dict[V]) set(key string, val V) bool {
 	return d.setHashed(key, dictHashString(key), val)
 }
 
-func (d *dict) delete(key []byte) bool { return d.deleteHashed(key, dictHash(key)) }
+func (d *dict[V]) delete(key []byte) bool { return d.deleteHashed(key, dictHash(key)) }
 
-func (d *dict) deleteString(key string) bool {
+func (d *dict[V]) deleteString(key string) bool {
 	d.step()
 	hash := dictHashString(key)
 	if d.tab[0].removeString(key, hash) || (d.rehashing() && d.tab[1].removeString(key, hash)) {
@@ -212,66 +214,70 @@ func (d *dict) deleteString(key string) bool {
 // key is not converted to a string: comparing a string field against
 // string(b) is recognised by the compiler and does not allocate, which is
 // what keeps GET on the zero-allocation path.
-func (d *dict) getHashed(key []byte, hash uint32) *Object {
+func (d *dict[V]) getHashed(key []byte, hash uint32) (V, bool) {
 	// tab[0] always has buckets -- newDict allocates them and the end of a
 	// rehash moves a real table into it -- so the common path needs no
 	// emptiness check and no loop over the two tables. Only a rehash in
 	// progress costs the second lookup.
-	if v := d.tab[0].lookup(key, hash); v != nil {
-		return v
+	if v, ok := d.tab[0].lookup(key, hash); ok {
+		return v, true
 	}
 	if d.rehashing() {
 		return d.tab[1].lookup(key, hash)
 	}
-	return nil
+	var zero V
+	return zero, false
 }
 
-// lookup finds key in one table. It returns nil both for "absent" and for a
-// nil value, which is sound because the keyspace never stores one: a key
-// exists exactly when it has an object.
-func (t *table) lookup(key []byte, hash uint32) *Object {
-	h := &t.heads[hash&t.mask]
-	if h.next == noHead {
-		return nil
-	}
-	if h.hash == hash && h.key == string(key) {
-		return h.val
-	}
-	over := t.over
-	for e := h.next; e != noEntry; {
-		en := &over[e]
-		if en.hash == hash && en.key == string(key) {
-			return en.val
-		}
-		e = en.next
-	}
-	return nil
-}
-
-// lookupString is lookup for a caller that already holds a string.
-func (t *table) lookupString(key string, hash uint32) *Object {
-	h := &t.heads[hash&t.mask]
-	if h.next == noHead {
-		return nil
-	}
-	if h.hash == hash && h.key == key {
-		return h.val
-	}
-	for e := h.next; e != noEntry; {
-		en := &t.over[e]
-		if en.hash == hash && en.key == key {
-			return en.val
-		}
-		e = en.next
-	}
-	return nil
-}
-
-// set stores val under key, reporting whether the key was new.
+// lookup finds key in one table, and lookupString does the same for a caller
+// that already holds a string. They report presence separately from the
+// value, because a dict may hold a type with no nil to stand in for absence.
 //
-// An existing key keeps its position: the value is replaced where it sits,
-// so a rewrite costs no rehash and cannot move the key past a live cursor.
-func (d *dict) setHashed(key string, hash uint32, val *Object) (added bool) {
+// key is not converted to a string: comparing a string field against
+// string(b) is recognised by the compiler and does not allocate, which is
+// what keeps GET on the zero-allocation path.
+func (t *table[V]) lookup(key []byte, hash uint32) (V, bool) {
+	h := &t.heads[hash&t.mask]
+	if h.next != noHead {
+		if h.hash == hash && h.key == string(key) {
+			return h.val, true
+		}
+		over := t.over
+		for e := h.next; e != noEntry; {
+			en := &over[e]
+			if en.hash == hash && en.key == string(key) {
+				return en.val, true
+			}
+			e = en.next
+		}
+	}
+	var zero V
+	return zero, false
+}
+
+func (t *table[V]) lookupString(key string, hash uint32) (V, bool) {
+	if len(t.heads) == 0 {
+		var zero V
+		return zero, false
+	}
+	h := &t.heads[hash&t.mask]
+	if h.next != noHead {
+		if h.hash == hash && h.key == key {
+			return h.val, true
+		}
+		for e := h.next; e != noEntry; {
+			en := &t.over[e]
+			if en.hash == hash && en.key == key {
+				return en.val, true
+			}
+			e = en.next
+		}
+	}
+	var zero V
+	return zero, false
+}
+
+func (d *dict[V]) setHashed(key string, hash uint32, val V) (added bool) {
 	d.step()
 
 	if d.tab[0].replace(key, hash, val) {
@@ -293,7 +299,7 @@ func (d *dict) setHashed(key string, hash uint32, val *Object) (added bool) {
 }
 
 // replace overwrites an existing key's value, reporting whether it found it.
-func (t *table) replace(key string, hash uint32, val *Object) bool {
+func (t *table[V]) replace(key string, hash uint32, val V) bool {
 	if len(t.heads) == 0 {
 		return false
 	}
@@ -315,19 +321,19 @@ func (t *table) replace(key string, hash uint32, val *Object) bool {
 }
 
 // insert adds an entry known not to be present.
-func (t *table) insert(key string, hash uint32, val *Object) {
+func (t *table[V]) insert(key string, hash uint32, val V) {
 	h := &t.heads[hash&t.mask]
 	if h.next == noHead {
-		*h = entry{hash: hash, next: noEntry, key: key, val: val}
+		*h = entry[V]{hash: hash, next: noEntry, key: key, val: val}
 	} else {
-		t.over = append(t.over, entry{hash: hash, next: h.next, key: key, val: val})
+		t.over = append(t.over, entry[V]{hash: hash, next: h.next, key: key, val: val})
 		h.next = int32(len(t.over) - 1)
 	}
 	t.live++
 }
 
 // deleteHashed removes key, reporting whether it was there.
-func (d *dict) deleteHashed(key []byte, hash uint32) bool {
+func (d *dict[V]) deleteHashed(key []byte, hash uint32) bool {
 	d.step()
 
 	if d.tab[0].remove(key, hash) || (d.rehashing() && d.tab[1].remove(key, hash)) {
@@ -340,7 +346,7 @@ func (d *dict) deleteHashed(key []byte, hash uint32) bool {
 // remove unlinks key from t, and removeString does the same for a caller
 // that already holds a string. Only the comparison differs; both hand the
 // position they found to unlink, which is where the care is.
-func (t *table) remove(key []byte, hash uint32) bool {
+func (t *table[V]) remove(key []byte, hash uint32) bool {
 	if len(t.heads) == 0 {
 		return false
 	}
@@ -365,7 +371,7 @@ func (t *table) remove(key []byte, hash uint32) bool {
 	return false
 }
 
-func (t *table) removeString(key string, hash uint32) bool {
+func (t *table[V]) removeString(key string, hash uint32) bool {
 	if len(t.heads) == 0 {
 		return false
 	}
@@ -395,11 +401,11 @@ func (t *table) removeString(key string, hash uint32) bool {
 // The first overflow entry is promoted into the bucket rather than an
 // indirection being left behind, so the fast path stays fast for whatever
 // is left in the chain.
-func (t *table) unlinkHead(h *entry) {
+func (t *table[V]) unlinkHead(h *entry[V]) {
 	if h.next == noEntry {
 		// Cleared rather than merely marked, so the collector is not left
 		// holding the key and its value through an empty bucket.
-		*h = entry{next: noHead}
+		*h = entry[V]{next: noHead}
 	} else {
 		i := h.next
 		*h = t.over[i]
@@ -409,7 +415,7 @@ func (t *table) unlinkHead(h *entry) {
 }
 
 // unlinkOverflow removes overflow entry at, whose predecessor is prev.
-func (t *table) unlinkOverflow(prev *entry, at int32) {
+func (t *table[V]) unlinkOverflow(prev *entry[V], at int32) {
 	// Unlinked before the arena is compacted, so the repointing walk inside
 	// dropOverflow cannot find this entry. prev may itself be the entry that
 	// compaction moves, which is safe because the write happens first and is
@@ -422,7 +428,7 @@ func (t *table) unlinkOverflow(prev *entry, at int32) {
 // dropOverflow removes slot i from the overflow arena by moving the last
 // entry into it and repointing whatever referred to that last entry. i must
 // already be unlinked from its chain.
-func (t *table) dropOverflow(i int32) {
+func (t *table[V]) dropOverflow(i int32) {
 	last := int32(len(t.over) - 1)
 	if i != last {
 		moved := t.over[last]
@@ -439,19 +445,19 @@ func (t *table) dropOverflow(i int32) {
 			}
 		}
 	}
-	t.over[last] = entry{}
+	t.over[last] = entry[V]{}
 	t.over = t.over[:last]
 }
 
 // ---------------------------------------------------------------- resizing
 
-func (d *dict) growIfFull() {
+func (d *dict[V]) growIfFull() {
 	if !d.rehashing() && d.tab[0].live >= d.tab[0].size() {
 		d.resize(d.tab[0].size() * 2)
 	}
 }
 
-func (d *dict) shrinkIfSparse() {
+func (d *dict[V]) shrinkIfSparse() {
 	if d.rehashing() {
 		return
 	}
@@ -469,14 +475,14 @@ func (d *dict) shrinkIfSparse() {
 // it would discard every entry already migrated into tab[1] and silently
 // lose those keys, and the loss would not surface until something went
 // looking for one of them.
-func (d *dict) resize(n int) bool {
+func (d *dict[V]) resize(n int) bool {
 	if d.rehashing() {
 		return false
 	}
 	if n < dictMinBuckets {
 		n = dictMinBuckets
 	}
-	d.tab[1] = newTable(n)
+	d.tab[1] = newTable[V](n)
 	d.rehashAt = 0
 	return true
 }
@@ -487,7 +493,7 @@ func (d *dict) resize(n int) bool {
 // One non-empty bucket per operation is enough to finish a rehash well
 // before the table needs the next one, because the table that keys are
 // leaving never grows.
-func (d *dict) step() {
+func (d *dict[V]) step() {
 	if d.rehashing() {
 		d.rehashBuckets(1)
 	}
@@ -498,7 +504,7 @@ func (d *dict) step() {
 //
 // The empty-bucket budget stops a long run of empty buckets turning one step
 // into a walk of the whole table, which is the pause this exists to avoid.
-func (d *dict) rehashBuckets(n int) bool {
+func (d *dict[V]) rehashBuckets(n int) bool {
 	if !d.rehashing() {
 		return false
 	}
@@ -528,7 +534,7 @@ func (d *dict) rehashBuckets(n int) bool {
 	}
 	if d.rehashAt >= src.size() {
 		d.tab[0] = d.tab[1]
-		d.tab[1] = table{}
+		d.tab[1] = table[V]{}
 		d.rehashAt = -1
 		return false
 	}
@@ -537,7 +543,7 @@ func (d *dict) rehashBuckets(n int) bool {
 
 // rehashSome advances a paused rehash, for the background cycle to call. It
 // reports whether more work remains.
-func (d *dict) rehashSome(buckets int) bool { return d.rehashBuckets(buckets) }
+func (d *dict[V]) rehashSome(buckets int) bool { return d.rehashBuckets(buckets) }
 
 // ---------------------------------------------------------------- scanning
 
@@ -557,7 +563,7 @@ func (d *dict) rehashSome(buckets int) bool { return d.rehashBuckets(buckets) }
 // While rehashing, the same cursor is applied to both tables: the smaller
 // table's bucket is visited once, then every bucket of the larger table that
 // the smaller one's index expands into.
-func (d *dict) scan(cursor uint64, fn func(key string, val *Object)) uint64 {
+func (d *dict[V]) scan(cursor uint64, fn func(key string, val V)) uint64 {
 	if d.len() == 0 {
 		return 0
 	}
@@ -587,8 +593,43 @@ func (d *dict) scan(cursor uint64, fn func(key string, val *Object)) uint64 {
 	return cursor & m1
 }
 
+// scanCount walks buckets until fn has emitted count entries or the
+// iteration is complete, and returns the cursor to resume from.
+//
+// fn reports whether it emitted the entry, so a filtered scan is bounded by
+// the buckets it walks rather than by the entries it keeps. Without that, a
+// MATCH rejecting everything would walk the whole table in one call to
+// produce an empty reply.
+func (d *dict[V]) scanCount(cursor uint64, count int, fn func(key string, val V) bool) uint64 {
+	emitted := 0
+	for budget := scanBudget(count); budget > 0; budget-- {
+		cursor = d.scan(cursor, func(k string, v V) {
+			if fn(k, v) {
+				emitted++
+			}
+		})
+		if cursor == 0 || emitted >= count {
+			break
+		}
+	}
+	return cursor
+}
+
+// scanBudget is how many buckets one call may walk for a given COUNT.
+//
+// The multiplier is capped so that a COUNT large enough to overflow it
+// cannot produce a budget of zero, which would return the cursor unchanged
+// and leave a client looping forever.
+func scanBudget(count int) int {
+	const maxScanBuckets = 1 << 40
+	if count >= maxScanBuckets/10 {
+		return maxScanBuckets
+	}
+	return count * 10
+}
+
 // visit calls fn for every entry in one bucket.
-func (t *table) visit(b uint32, fn func(key string, val *Object)) {
+func (t *table[V]) visit(b uint32, fn func(key string, val V)) {
 	if len(t.heads) == 0 {
 		return
 	}
@@ -620,7 +661,7 @@ func nextCursor(v, mask uint64) uint64 {
 //
 // It does not step the rehash: a caller iterating the whole table must not
 // have entries move underneath it.
-func (d *dict) forEach(fn func(key string, val *Object) bool) {
+func (d *dict[V]) forEach(fn func(key string, val V) bool) {
 	for i := range d.tab {
 		t := &d.tab[i]
 		for j := range t.heads {
@@ -653,9 +694,10 @@ func (d *dict) forEach(fn func(key string, val *Object) bool) {
 // factor is held near one, and what samples this -- eviction and the expiry
 // cycle -- draws several candidates and compares them rather than trusting
 // any single draw.
-func (d *dict) randomEntry(rnd func(n int) int) (string, *Object, bool) {
+func (d *dict[V]) randomEntry(rnd func(n int) int) (string, V, bool) {
+	var zero V
 	if d.len() == 0 {
-		return "", nil, false
+		return "", zero, false
 	}
 	// Bounded, so that an unlucky run of empty buckets cannot become an
 	// unbounded loop. The caller treats a miss as a sample that found
@@ -686,25 +728,26 @@ func (d *dict) randomEntry(rnd func(n int) int) (string, *Object, bool) {
 			}
 		}
 	}
-	return "", nil, false
+	return "", zero, false
 }
 
 // ------------------------------------------------------------------ memory
 
-// dictEntrySize is what one slot costs: hash(4) + next(4) + string
-// header(16) + pointer(8). It excludes the key's own bytes and the object.
-const dictEntrySize = 32
+// entrySize is what one slot costs for this value type: the hash, the chain
+// link, the string header and the value itself. It is a compile-time
+// constant per instantiation -- 32 bytes when the value is a pointer.
+func entrySize[V any]() int64 { return int64(unsafe.Sizeof(entry[V]{})) }
 
 // overhead is the dict's own cost in bytes: the bucket arrays and the
 // capacity of the overflow arenas.
 //
 // Unlike the runtime's map this is exact rather than estimated, because
 // every allocation belongs to the table and none of it is hidden.
-func (d *dict) overhead() int64 {
+func (d *dict[V]) overhead() int64 {
 	var n int64
 	for i := range d.tab {
 		t := &d.tab[i]
-		n += int64(len(t.heads)+cap(t.over)) * dictEntrySize
+		n += int64(len(t.heads)+cap(t.over)) * entrySize[V]()
 	}
 	return n
 }

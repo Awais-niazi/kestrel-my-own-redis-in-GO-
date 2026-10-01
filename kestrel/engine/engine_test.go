@@ -321,7 +321,8 @@ func stillPresent(db *DB, key string) bool {
 	s := db.shardFor([]byte(key))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.dict.getString(key) != nil
+	_, ok := s.dict.getString(key)
+	return ok
 }
 
 func TestReplicaHidesButDoesNotDelete(t *testing.T) {

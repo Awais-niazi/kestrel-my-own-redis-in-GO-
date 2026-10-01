@@ -197,8 +197,8 @@ func (ks *Keyspace) evictOne(cfg evictionConfig) bool {
 	s := bestDB.shardFor([]byte(bestKey))
 	s.prop.Lock()
 	s.mu.Lock()
-	o := s.dict.getString(bestKey)
-	ok := o != nil && o == bestObj
+	o, found := s.dict.getString(bestKey)
+	ok := found && o == bestObj
 	if ok {
 		bestDB.removeLocked(s, bestKey, o)
 		s.evictedKeys++
@@ -215,7 +215,7 @@ func (ks *Keyspace) evictOne(cfg evictionConfig) bool {
 func sampleCandidate(s *shard, policy EvictionPolicy) (string, *Object) {
 	if policy.volatileOnly() {
 		for k := range s.expires {
-			if o := s.dict.getString(k); o != nil {
+			if o, ok := s.dict.getString(k); ok {
 				return k, o
 			}
 		}

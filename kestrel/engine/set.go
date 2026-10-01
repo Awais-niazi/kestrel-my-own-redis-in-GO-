@@ -56,7 +56,7 @@ func (s *intset) EstimatedSize() int64 { return int64(sliceHeaderSize + 8*cap(s.
 type Set struct {
 	is *intset
 	lp *listpack
-	m  map[string]struct{}
+	m  *dict[struct{}]
 }
 
 func newSet(firstMember []byte, t *Thresholds) *Set {
@@ -64,7 +64,7 @@ func newSet(firstMember []byte, t *Thresholds) *Set {
 		return &Set{is: &intset{}}
 	}
 	if len(firstMember) > t.SetMaxListpackValue {
-		return &Set{m: make(map[string]struct{})}
+		return &Set{m: newDict[struct{}]()}
 	}
 	return &Set{lp: newListpack(0)}
 }
@@ -73,7 +73,7 @@ func newSet(firstMember []byte, t *Thresholds) *Set {
 func (s *Set) Len() int {
 	switch {
 	case s.m != nil:
-		return len(s.m)
+		return s.m.len()
 	case s.is != nil:
 		return s.is.Len()
 	default:
@@ -97,10 +97,11 @@ func (s *Set) Encoding() Encoding {
 func (s *Set) EstimatedSize() int64 {
 	switch {
 	case s.m != nil:
-		n := int64(48)
-		for k := range s.m {
-			n += int64(mapEntryOverhead + len(k))
-		}
+		n := int64(48) + s.m.overhead()
+		s.m.forEach(func(k string, _ struct{}) bool {
+			n += int64(len(k))
+			return true
+		})
 		return n
 	case s.is != nil:
 		return s.is.EstimatedSize()
@@ -113,10 +114,11 @@ func (s *Set) EstimatedSize() int64 {
 func (s *Set) Clone() any {
 	switch {
 	case s.m != nil:
-		m := make(map[string]struct{}, len(s.m))
-		for k := range s.m {
-			m[k] = struct{}{}
-		}
+		m := newDict[struct{}]()
+		s.m.forEach(func(k string, _ struct{}) bool {
+			m.set(k, struct{}{})
+			return true
+		})
 		return &Set{m: m}
 	case s.is != nil:
 		v := make([]int64, len(s.is.v))
@@ -131,7 +133,7 @@ func (s *Set) Clone() any {
 func (s *Set) Contains(member []byte) bool {
 	switch {
 	case s.m != nil:
-		_, ok := s.m[string(member)]
+		_, ok := s.m.get(member)
 		return ok
 	case s.is != nil:
 		n, ok := canonicalInt(member)
@@ -144,10 +146,10 @@ func (s *Set) Contains(member []byte) bool {
 // Add inserts a member and reports whether it was new.
 func (s *Set) Add(member []byte, t *Thresholds) bool {
 	if s.m != nil {
-		if _, ok := s.m[string(member)]; ok {
+		if _, ok := s.m.get(member); ok {
 			return false
 		}
-		s.m[string(member)] = struct{}{}
+		s.m.set(string(member), struct{}{})
 		return true
 	}
 	if s.is != nil {
@@ -181,9 +183,9 @@ func (s *Set) Add(member []byte, t *Thresholds) bool {
 func (s *Set) demoteIntset(t *Thresholds, incomingLen int) {
 	toMap := s.is.Len() >= t.SetMaxListpackEntries || incomingLen > t.SetMaxListpackValue
 	if toMap {
-		m := make(map[string]struct{}, s.is.Len())
+		m := newDict[struct{}]()
 		for _, n := range s.is.v {
-			m[strconv.FormatInt(n, 10)] = struct{}{}
+			m.set(strconv.FormatInt(n, 10), struct{}{})
 		}
 		s.m, s.is = m, nil
 		return
@@ -197,9 +199,9 @@ func (s *Set) demoteIntset(t *Thresholds, incomingLen int) {
 }
 
 func (s *Set) promoteToMap() {
-	m := make(map[string]struct{}, s.lp.Len())
+	m := newDict[struct{}]()
 	s.lp.Each(func(_ int, e []byte) bool {
-		m[string(e)] = struct{}{}
+		m.set(string(e), struct{}{})
 		return true
 	})
 	s.m, s.lp = m, nil
@@ -209,10 +211,10 @@ func (s *Set) promoteToMap() {
 func (s *Set) Remove(member []byte) bool {
 	switch {
 	case s.m != nil:
-		if _, ok := s.m[string(member)]; !ok {
+		if _, ok := s.m.get(member); !ok {
 			return false
 		}
-		delete(s.m, string(member))
+		s.m.delete(member)
 		return true
 	case s.is != nil:
 		n, ok := canonicalInt(member)
@@ -232,9 +234,10 @@ func (s *Set) Members() [][]byte {
 	out := make([][]byte, 0, s.Len())
 	switch {
 	case s.m != nil:
-		for k := range s.m {
+		s.m.forEach(func(k string, _ struct{}) bool {
 			out = append(out, []byte(k))
-		}
+			return true
+		})
 	case s.is != nil:
 		var buf [20]byte
 		for _, n := range s.is.v {

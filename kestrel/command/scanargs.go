@@ -58,6 +58,12 @@ func parseScanArgs(c *Ctx, from int, allowNoValues bool) (uint64, subScanOptions
 	return uint64(cursor), opts, resp.Value{}, true
 }
 
+// scanReply renders the two-element [cursor, entries] reply the SCAN family
+// returns.
+func scanReply(cursor uint64, entries [][]byte) resp.Value {
+	return resp.Array(resp.Bulk(itob(int64(cursor))), bulkArray(entries))
+}
+
 // bulkArray renders a slice of byte strings as an array reply.
 func bulkArray(items [][]byte) resp.Value {
 	out := make([]resp.Value, len(items))

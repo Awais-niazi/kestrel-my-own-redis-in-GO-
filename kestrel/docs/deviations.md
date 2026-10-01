@@ -35,18 +35,19 @@ the reply from below. On a 126,544-key server, `SCAN 0 COUNT 10` returned
 
 ### HSCAN, SSCAN and ZSCAN
 
-These still return the whole collection in one call with a zero cursor. That
-is what the reference implementation does for the compact encodings, and this
-implementation extends it to the promoted ones, which are Go maps and so have
-no stable iteration order to build a cursor on. `COUNT` is accepted and
-ignored.
+**No longer a deviation either.** These page like `SCAN`, over the same
+table, with the same guarantee.
 
-Giving the promoted encodings the same table the keyspace now uses would
-close this too, and is the remaining piece of that work.
+A collection below its configured thresholds is a listpack or an intset, and
+the whole thing still comes back in one call with a zero cursor. That is
+what the reference implementation does for its compact encodings, and the
+encoding is bounded by configuration, so the reply is bounded with it.
 
-For a listpack-encoded collection, which is the common case, the behaviour is
-identical to the reference. For a very large hash or set the reply is large,
-in the same way `HGETALL` on such a key is already large.
+Above the thresholds the collection is promoted, and the promoted encodings
+used to be Go maps with no stable iteration order, so there was no cursor to
+give: a hash of fifty thousand fields answered `HSCAN ... COUNT 10` with all
+fifty thousand and a cursor of `0`. They are now the same table the keyspace
+uses, so the same reverse-binary cursor applies and `COUNT` is honoured.
 
 ## INCRBYFLOAT rendering
 

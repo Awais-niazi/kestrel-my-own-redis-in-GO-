@@ -187,3 +187,121 @@ func (db *DB) StoreList(key []byte, elements [][]byte) int64 {
 	db.finishWrite(s, key, o, l)
 	return int64(l.Len())
 }
+
+// Collection cursors.
+//
+// HSCAN, SSCAN and ZSCAN page through one key's members the way SCAN pages
+// through the keyspace. For a listpack-encoded collection the whole thing
+// comes back in one call with a zero cursor, which is what the reference
+// implementation does too: the encoding is bounded by configuration, so the
+// reply is bounded with it, and a cursor over a flat array buys nothing.
+//
+// For a promoted collection the reply used to be the whole thing as well,
+// and that was the deviation: a hash of a million fields answered HSCAN with
+// a million fields, whatever COUNT said. The promoted encodings are now the
+// same table the keyspace uses, so they get the same cursor.
+
+// CollectionScan bounds and filters a collection scan.
+type CollectionScan struct {
+	Match []byte // glob pattern over the member or field name, nil for all
+	Count int    // approximate upper bound on entries returned per call
+}
+
+func (o CollectionScan) count() int {
+	if o.Count <= 0 {
+		return 10
+	}
+	return o.Count
+}
+
+// HScan pages through a hash. Entries alternate field and value unless
+// fieldsOnly is set, which is what HSCAN's NOVALUES asks for.
+func (db *DB) HScan(key []byte, cursor uint64, opts CollectionScan, fieldsOnly bool) (uint64, [][]byte, error) {
+	s := db.lockKey(key)
+	defer db.unlockKey(s)
+
+	_, h, err := db.hashRead(s, key)
+	if err != nil || h == nil {
+		return 0, nil, err
+	}
+	out := make([][]byte, 0, opts.count())
+	emit := func(field, value []byte) bool {
+		if opts.Match != nil && !MatchPattern(opts.Match, field) {
+			return false
+		}
+		out = append(out, copyBytes(field))
+		if !fieldsOnly {
+			out = append(out, copyBytes(value))
+		}
+		return true
+	}
+	if h.m == nil {
+		all := h.All() // field, value, field, value
+		for i := 0; i+1 < len(all); i += 2 {
+			emit(all[i], all[i+1])
+		}
+		return 0, out, nil
+	}
+	next := h.m.scanCount(cursor, opts.count(), func(field string, value []byte) bool {
+		return emit([]byte(field), value)
+	})
+	return next, out, nil
+}
+
+// SScan pages through a set.
+func (db *DB) SScan(key []byte, cursor uint64, opts CollectionScan) (uint64, [][]byte, error) {
+	s := db.lockKey(key)
+	defer db.unlockKey(s)
+
+	_, set, err := db.setRead(s, key)
+	if err != nil || set == nil {
+		return 0, nil, err
+	}
+	out := make([][]byte, 0, opts.count())
+	emit := func(member []byte) bool {
+		if opts.Match != nil && !MatchPattern(opts.Match, member) {
+			return false
+		}
+		out = append(out, copyBytes(member))
+		return true
+	}
+	if set.m == nil {
+		// An intset or a listpack is bounded by configuration, so the whole
+		// thing is one page.
+		for _, m := range set.Members() {
+			emit(m)
+		}
+		return 0, out, nil
+	}
+	next := set.m.scanCount(cursor, opts.count(), func(member string, _ struct{}) bool {
+		return emit([]byte(member))
+	})
+	return next, out, nil
+}
+
+// ZScan pages through a sorted set. Entries alternate member and score.
+func (db *DB) ZScan(key []byte, cursor uint64, opts CollectionScan) (uint64, [][]byte, error) {
+	s := db.lockKey(key)
+	defer db.unlockKey(s)
+
+	_, z, err := db.zsetRead(s, key)
+	if err != nil || z == nil {
+		return 0, nil, err
+	}
+	out := make([][]byte, 0, opts.count()*2)
+	emit := func(member []byte, score float64) bool {
+		if opts.Match != nil && !MatchPattern(opts.Match, member) {
+			return false
+		}
+		out = append(out, copyBytes(member), FormatFloat(score))
+		return true
+	}
+	if z.lp != nil {
+		z.Each(func(m ZMember) bool { emit(m.Member, m.Score); return true })
+		return 0, out, nil
+	}
+	next := z.m.scanCount(cursor, opts.count(), func(member string, score float64) bool {
+		return emit([]byte(member), score)
+	})
+	return next, out, nil
+}

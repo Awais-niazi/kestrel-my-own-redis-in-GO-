@@ -10,15 +10,19 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-func dictSet(d *dict, key string, val *Object) bool { return d.set(key, val) }
-func dictGet(d *dict, key string) *Object           { return d.get([]byte(key)) }
-func dictDel(d *dict, key string) bool              { return d.delete([]byte(key)) }
+func dictSet(d *dict[*Object], key string, val *Object) bool { return d.set(key, val) }
+func dictDel(d *dict[*Object], key string) bool              { return d.delete([]byte(key)) }
+
+func dictGet(d *dict[*Object], key string) *Object {
+	o, _ := d.get([]byte(key))
+	return o
+}
 
 func obj(s string) *Object { return &Object{Type: TypeString, Value: []byte(s)} }
 
 // finishRehash drains any rehash left running by the inserts above, so a
 // test that drives a rehash by hand starts from an idle table.
-func finishRehash(d *dict) {
+func finishRehash(d *dict[*Object]) {
 	for d.rehashing() {
 		d.rehashSome(64)
 	}
@@ -31,7 +35,7 @@ func finishRehash(d *dict) {
 // at the vacated slot is a corruption that a get would not necessarily
 // notice -- it would find the wrong key, or walk off the end, depending on
 // what landed there next.
-func checkDict(t *testing.T, d *dict, want map[string]*Object) {
+func checkDict(t *testing.T, d *dict[*Object], want map[string]*Object) {
 	t.Helper()
 
 	seen := map[string]bool{}
@@ -51,7 +55,7 @@ func checkDict(t *testing.T, d *dict, want map[string]*Object) {
 				continue
 			}
 			for e, first := int32(b), true; ; first = false {
-				var en *entry
+				var en *entry[*Object]
 				if first {
 					en = h
 				} else {
@@ -100,7 +104,7 @@ func checkDict(t *testing.T, d *dict, want map[string]*Object) {
 }
 
 func TestDictHoldsWhatIsPutInIt(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	want := map[string]*Object{}
 
 	for i := 0; i < 500; i++ {
@@ -144,7 +148,7 @@ func TestDictHoldsWhatIsPutInIt(t *testing.T) {
 // also the case where compact does the most work, because every entry shares
 // one chain.
 func TestDictSurvivesTotalHashCollision(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	keys := make([]string, 200)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("k%d", i)
@@ -154,7 +158,7 @@ func TestDictSurvivesTotalHashCollision(t *testing.T) {
 		t.Fatalf("holds %d keys, want %d", d.len(), len(keys))
 	}
 	for _, k := range keys {
-		if got := d.getHashed([]byte(k), 0); got == nil {
+		if _, ok := d.getHashed([]byte(k), 0); !ok {
 			t.Fatalf("%q is missing from a fully collided table", k)
 		}
 	}
@@ -172,7 +176,7 @@ func TestDictSurvivesTotalHashCollision(t *testing.T) {
 // sequence of writes, rewrites and deletes against a plain map, with the
 // structure checked as it goes.
 func TestDictMatchesAMapUnderRandomOperations(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	want := map[string]*Object{}
 	r := rand.New(rand.NewSource(7))
 
@@ -205,7 +209,7 @@ func TestDictMatchesAMapUnderRandomOperations(t *testing.T) {
 
 // scanAll runs a full iteration and returns every key it saw, with
 // duplicates, plus the number of calls it took.
-func scanAll(d *dict, between func()) ([]string, int) {
+func scanAll(d *dict[*Object], between func()) ([]string, int) {
 	var out []string
 	var calls int
 	var cursor uint64
@@ -225,7 +229,7 @@ func scanAll(d *dict, between func()) ([]string, int) {
 
 func TestDictScanVisitsEveryKeyExactlyOnceWhenNothingChanges(t *testing.T) {
 	for _, n := range []int{0, 1, 7, 64, 1000} {
-		d := newDict()
+		d := newDict[*Object]()
 		want := map[string]bool{}
 		for i := 0; i < n; i++ {
 			k := fmt.Sprintf("key%d", i)
@@ -260,7 +264,7 @@ func TestDictScanVisitsEveryKeyExactlyOnceWhenNothingChanges(t *testing.T) {
 // times the buckets moved underneath the cursor; duplicates are allowed,
 // which is what the reference implementation promises too.
 func TestDictScanReturnsEveryKeyThatStaysPut(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	const stable = 300
 	for i := 0; i < stable; i++ {
 		k := fmt.Sprintf("stay%d", i)
@@ -309,7 +313,7 @@ func TestDictScanReturnsEveryKeyThatStaysPut(t *testing.T) {
 // TestDictScanTerminatesFromAnyCursor checks that a client cannot wedge a
 // scan by sending a cursor the server never issued.
 func TestDictScanTerminatesFromAnyCursor(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	for i := 0; i < 200; i++ {
 		k := fmt.Sprintf("key%d", i)
 		dictSet(d, k, obj(k))
@@ -329,7 +333,7 @@ func TestDictScanTerminatesFromAnyCursor(t *testing.T) {
 }
 
 func TestDictScanWhileRehashingCoversBothTables(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	const n = 500
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("key%d", i)
@@ -363,7 +367,7 @@ func TestDictScanWhileRehashingCoversBothTables(t *testing.T) {
 // TestRehashIsIncremental checks that no single operation pays for the whole
 // table, which is the pause ADR-004 flags as R6.
 func TestRehashIsIncremental(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	for i := 0; i < 1000; i++ {
 		k := fmt.Sprintf("key%d", i)
 		dictSet(d, k, obj(k))
@@ -389,7 +393,7 @@ func TestRehashIsIncremental(t *testing.T) {
 }
 
 func TestRehashFinishesAndKeepsEveryKey(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	want := map[string]*Object{}
 	for i := 0; i < 2000; i++ {
 		k := fmt.Sprintf("key%d", i)
@@ -409,7 +413,7 @@ func TestRehashFinishesAndKeepsEveryKey(t *testing.T) {
 }
 
 func TestDictShrinksWhenItEmptiesOut(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	for i := 0; i < 4000; i++ {
 		k := fmt.Sprintf("key%d", i)
 		dictSet(d, k, obj(k))
@@ -441,7 +445,7 @@ func TestDictShrinksWhenItEmptiesOut(t *testing.T) {
 // The point is coverage, not distribution: what samples this compares
 // several candidates, so what matters is that no key is unreachable.
 func TestDictSamplingReachesEveryKey(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	const n = 200
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("key%d", i)
@@ -476,13 +480,13 @@ func TestDictSamplingReachesEveryKey(t *testing.T) {
 	if len(seen) != len(want) {
 		t.Errorf("sampling reached %d of %d keys; some are unreachable", len(seen), len(want))
 	}
-	if _, _, ok := newDict().randomEntry(r.Intn); ok {
+	if _, _, ok := newDict[*Object]().randomEntry(r.Intn); ok {
 		t.Error("sampling an empty dict returned a key")
 	}
 }
 
 func TestDictForEachVisitsEverything(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	want := []string{}
 	for i := 0; i < 300; i++ {
 		k := fmt.Sprintf("key%d", i)
@@ -522,7 +526,7 @@ func TestDictForEachVisitsEverything(t *testing.T) {
 // ------------------------------------------------------------------ memory
 
 func TestDictOverheadTracksTheTable(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	empty := d.overhead()
 	if empty <= 0 {
 		t.Fatalf("an empty dict reports %d bytes of overhead", empty)
@@ -537,7 +541,8 @@ func TestDictOverheadTracksTheTable(t *testing.T) {
 	}
 	// It must be in the right order of magnitude: a thousand keys cost a
 	// thousand slots plus the spare ones, not a thousand times that.
-	if perKey := full / 1000; perKey < dictEntrySize || perKey > 4*dictEntrySize {
+	slot := entrySize[*Object]()
+	if perKey := full / 1000; perKey < slot || perKey > 4*slot {
 		t.Errorf("overhead is %d bytes per key, which is not the table plus its overflow", perKey)
 	}
 }
@@ -551,7 +556,7 @@ func FuzzDict(f *testing.F) {
 	f.Add([]byte{1, 1, 1, 1, 2, 2, 2, 2})
 
 	f.Fuzz(func(t *testing.T, ops []byte) {
-		d := newDict()
+		d := newDict[*Object]()
 		want := map[string]*Object{}
 		for i := 0; i+1 < len(ops); i += 2 {
 			k := fmt.Sprintf("k%d", ops[i+1])
@@ -613,7 +618,7 @@ func benchKeys(n int) [][]byte {
 func BenchmarkDictGet(b *testing.B) {
 	const n = 100000
 	keys := benchKeys(n)
-	d := newDict()
+	d := newDict[*Object]()
 	for _, k := range keys {
 		d.set(string(k), obj("v"))
 	}
@@ -623,7 +628,7 @@ func BenchmarkDictGet(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		k := keys[order[i%n]]
 		_ = xxhash.Sum64(k) & 15 // the shard index, as the keyspace takes it
-		if d.get(k) == nil {
+		if _, ok := d.get(k); !ok {
 			b.Fatal("missing key")
 		}
 	}
@@ -655,7 +660,7 @@ func BenchmarkDictSet(b *testing.B) {
 	for i, k := range keys {
 		strs[i] = string(k)
 	}
-	d := newDict()
+	d := newDict[*Object]()
 	o := obj("v")
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -669,7 +674,7 @@ func BenchmarkDictSet(b *testing.B) {
 // pays in total.
 func BenchmarkDictScanFullIteration(b *testing.B) {
 	const n = 100000
-	d := newDict()
+	d := newDict[*Object]()
 	for _, k := range benchKeys(n) {
 		d.set(string(k), obj("v"))
 	}
@@ -696,7 +701,7 @@ func BenchmarkDictScanFullIteration(b *testing.B) {
 func BenchmarkDictGetBigger(b *testing.B) {
 	const n = 1000000
 	keys := benchKeys(n)
-	d := newDict()
+	d := newDict[*Object]()
 	for _, k := range keys {
 		d.set(string(k), obj("v"))
 	}
@@ -709,7 +714,7 @@ func BenchmarkDictGetBigger(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		k := keys[order[i%n]]
 		_ = xxhash.Sum64(k) & 15
-		if d.get(k) == nil {
+		if _, ok := d.get(k); !ok {
 			b.Fatal("missing key")
 		}
 	}
@@ -756,7 +761,7 @@ func TestDictOverheadIsWhatTheHeapSays(t *testing.T) {
 	}
 
 	base := liveHeapBytes()
-	d := newDict()
+	d := newDict[*Object]()
 	for i := range keys {
 		d.set(keys[i], objs[i])
 	}
@@ -796,7 +801,7 @@ func liveHeapBytes() uint64 {
 // probes two tables instead of one. Nothing in the read path will ever
 // finish it.
 func TestRehashStalls(t *testing.T) {
-	d := newDict()
+	d := newDict[*Object]()
 	// Write until a rehash starts, then stop, as a load that fills a cache
 	// and then serves it does.
 	i := 0

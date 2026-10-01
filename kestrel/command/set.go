@@ -292,20 +292,14 @@ func cmdSInterCard(c *Ctx) resp.Value {
 }
 
 func cmdSScan(c *Ctx) resp.Value {
-	_, opts, reply, ok := parseScanArgs(c, 3, false)
+	cursor, opts, reply, ok := parseScanArgs(c, 3, false)
 	if !ok {
 		return reply
 	}
-	members, err := c.DB().SMembers(c.Arg(1))
+	next, out, err := c.DB().SScan(c.Arg(1), cursor,
+		engine.CollectionScan{Match: opts.Match, Count: opts.Count})
 	if err != nil {
 		return engineError(err)
 	}
-	out := make([]resp.Value, 0, len(members))
-	for _, m := range members {
-		if opts.Match != nil && !engine.MatchPattern(opts.Match, m) {
-			continue
-		}
-		out = append(out, resp.Bulk(m))
-	}
-	return resp.Array(resp.BulkString("0"), resp.ArrayOf(out))
+	return scanReply(next, out)
 }
