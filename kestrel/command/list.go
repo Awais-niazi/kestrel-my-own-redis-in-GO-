@@ -147,7 +147,7 @@ func listPop(c *Ctx, front bool) resp.Value {
 		}
 		count = int(n)
 	}
-	out, err := c.DB().LPop(c.Arg(1), count, front)
+	out, existed, err := c.DB().LPop(c.Arg(1), count, front)
 	if err != nil {
 		return engineError(err)
 	}
@@ -158,7 +158,9 @@ func listPop(c *Ctx, front bool) resp.Value {
 		}
 		return resp.Bulk(out[0])
 	}
-	if len(out) == 0 {
+	// With a count, a missing key is a null array and a present one is an
+	// array of what came out -- empty when the count was zero.
+	if !existed {
 		return resp.NullArray()
 	}
 	return bulkArray(out)

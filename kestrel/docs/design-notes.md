@@ -1872,3 +1872,81 @@ promises.
 
 **A test that depends on a random draw it does not control is not testing
 the thing it names.**
+
+---
+
+## 31. Testing against Redis instead of against our idea of Redis
+
+Every test in this repository compares Kestrel to what its author believed
+the reference does. None of them compared it to the reference. The gap
+between those two things is exactly where conformance bugs live, because a
+test and the code it covers share the same misunderstanding and agree with
+each other perfectly.
+
+`difftest` closes it: both servers get the same randomized command stream
+and their replies are compared. It found four bugs in the first forty
+thousand commands, all of them in code that every unit test passed.
+
+### What it found
+
+**`RENAMENX k k` returned 1.** The self-rename shortcut ran before the NX
+check, so renaming a key to its own name reported success. The destination
+exists -- it is the same key -- so the reference answers 0. Plain
+`RENAME k k` still succeeds, which is why the shortcut was there.
+
+**Infinite scores went on the wire as `+Inf`.** Go's float formatter spells
+the infinities that way; the reference spells them `inf` and `-inf`.
+`ZSCORE` was right because it replies with a RESP double, and `ZRANGE
+WITHSCORES` was wrong because it formats the number itself -- two
+formatters, one of them never compared against anything.
+
+Worse than the reply: the same formatter writes the effect log. A
+`ZADD key inf member` was being recorded as `ZADD key +Inf member`, so the
+log and the replication stream contained text no other Redis would read.
+Kestrel's own parser accepts it, which is precisely why nothing noticed.
+
+**`LPOP key 0` returned a null array** where the reference returns an empty
+one. The code tested `len(out) == 0`, which conflates "no such key" with
+"popped nothing", and those are different replies. The engine now reports
+whether the key existed, because the command layer cannot work it out from
+an empty slice.
+
+**`GETRANGE` resolved negative indexes wrongly, twice.** It shared a helper
+with `LRANGE`, and the two conventions are not the same:
+
+- A pair written negative and the wrong way round is rejected *before* the
+  indexes are resolved. That is why `GETRANGE k -5 -6` is empty while
+  `GETRANGE k 0 -6` is not, even though both ends resolve to the same
+  place. Nothing but a matrix of probes against a live server would have
+  suggested that rule; it certainly does not follow from the documentation.
+- An end still negative after the length is added clamps up to zero, where
+  `LRANGE` leaves it negative and so returns nothing.
+
+The first fix was wrong, and the differential test caught that too: clamping
+the end without adding the early rejection made `GETRANGE k -6 -8` return a
+byte where the reference returns nothing. **A fix derived from one failing
+case is a guess about the rule.**
+
+### Three findings that were not bugs
+
+Worth recording, because each one cost time and each one would have
+recurred:
+
+- **`INCRBYFLOAT` drifts in the last digits.** That is the documented
+  float64-against-long-double deviation. Comparing the text reported it on
+  every run and buried everything else, so the comparison is numeric with a
+  tolerance. It also *contaminates*: the stored value differs as text, so a
+  later `GETRANGE` of that key differs too, and the cause is nowhere near
+  the symptom.
+- **`ZRANGEBYLEX` over mixed scores.** The reference says the result is
+  unspecified unless every member shares a score, and it means it: it walks
+  its skiplist in score order and returns whatever that passes. Those
+  commands now have a key pool whose scores are always zero.
+- **`EXPIRE key N GT` with the same N twice.** The new deadline and the old
+  one differ by however long the command took to arrive, which is sometimes
+  zero milliseconds and sometimes one. Either answer is correct. The
+  generator now uses widely separated values so the comparison is decided by
+  magnitude.
+
+**A differential test is only as good as its account of what is allowed to
+differ**, and that account is most of the work.

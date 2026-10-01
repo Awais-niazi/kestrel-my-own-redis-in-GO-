@@ -261,7 +261,7 @@ func blockingPop(c *Ctx, front bool) resp.Value {
 
 	return blockUntil(c, keys, timeout, func() (resp.Value, bool) {
 		for _, key := range keys {
-			vals, err := c.DB().LPop(key, 1, front)
+			vals, _, err := c.DB().LPop(key, 1, front)
 			if err != nil {
 				return engineError(err), true
 			}

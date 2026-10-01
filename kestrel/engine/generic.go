@@ -70,12 +70,15 @@ func (db *DB) Rename(src, dst []byte, nx bool) (ok bool, err error) {
 	if o == nil {
 		return false, ErrNoSuchKey
 	}
-	if string(src) == string(dst) {
-		// Renaming a key to itself succeeds and changes nothing.
-		return true, nil
-	}
+	// The NX check comes first, including when the two names are the same.
+	// A key is its own destination, so RENAMENX k k fails on an existing
+	// destination like any other -- the reference answers 0 -- while plain
+	// RENAME k k succeeds and changes nothing.
 	if nx && db.lookup(ds, dst) != nil {
 		return false, nil
+	}
+	if string(src) == string(dst) {
+		return true, nil
 	}
 	db.removeLocked(ss, string(src), o)
 	db.store(ds, dst, o)

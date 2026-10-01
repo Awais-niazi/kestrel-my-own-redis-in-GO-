@@ -162,7 +162,7 @@ func (db *DB) GetRange(key []byte, start, end int64) ([]byte, error) {
 		return nil, err
 	}
 	val := o.stringBytes()
-	lo, hi, ok := clampRange(start, end, int64(len(val)))
+	lo, hi, ok := getRangeBounds(start, end, int64(len(val)))
 	if !ok {
 		return nil, nil
 	}
@@ -369,6 +369,17 @@ func ParseFloat(b []byte) (float64, error) { return parseFloat(b) }
 // trailing zeros removed, so that repeated increments produce stable,
 // replay-safe text (ADR-008).
 func FormatFloat(f float64) []byte {
+	// The reference spells the infinities "inf" and "-inf", in replies and
+	// in its own persistence. Go's formatter spells them "+Inf" and "-Inf",
+	// which a client parsing a score will not recognise -- and which this
+	// server was writing into its own effect log, so a replica and a replay
+	// were being handed text no other Redis would read.
+	if math.IsInf(f, 1) {
+		return []byte("inf")
+	}
+	if math.IsInf(f, -1) {
+		return []byte("-inf")
+	}
 	if f == math.Trunc(f) && math.Abs(f) < 1e17 {
 		return strconv.AppendInt(nil, int64(f), 10)
 	}
@@ -381,8 +392,41 @@ func FormatFloat(f float64) []byte {
 	return strconv.AppendFloat(nil, f, 'f', -1, 64)
 }
 
+// getRangeBounds resolves GETRANGE's indexes, which are not quite the
+// convention clampRange implements.
+//
+// Two differences, both of which the reference has and both of which are
+// observable. A pair written negative and the wrong way round is rejected
+// before anything is resolved, so GETRANGE k -5 -6 is empty while
+// GETRANGE k 0 -6 is not, even though both ends resolve to the same place.
+// And an end still negative after the length is added clamps up to zero,
+// where LRANGE leaves it negative and so returns nothing.
+//
+// The pair of them is why GETRANGE k -10 -6 on "hello" is "h" and
+// GETRANGE k -5 -10 is empty.
+func getRangeBounds(start, end, length int64) (int64, int64, bool) {
+	if start < 0 && end < 0 && start > end {
+		return 0, 0, false
+	}
+	// Clamped before the addition rather than after, so an index far enough
+	// below zero cannot overflow int64 on the way back up.
+	if start < 0 {
+		start = max(start, -length) + length
+	}
+	if end < 0 {
+		end = max(end, -length) + length
+	}
+	if end >= length {
+		end = length - 1
+	}
+	if start > end || length == 0 {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
 // clampRange resolves the inclusive [start,end] convention shared by
-// GETRANGE, LRANGE and friends. It reports false when the range is empty.
+// LRANGE, LTRIM and friends. It reports false when the range is empty.
 func clampRange(start, end, length int64) (int64, int64, bool) {
 	if length == 0 {
 		return 0, 0, false

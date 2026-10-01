@@ -502,13 +502,16 @@ func (db *DB) LPush(key []byte, values [][]byte, front, mustExist bool) (int64, 
 }
 
 // LPop removes up to count elements from one end.
-func (db *DB) LPop(key []byte, count int, front bool) ([][]byte, error) {
+// The second return reports whether the key existed, which is not the same
+// question as whether anything came back: LPOP key 0 pops nothing from a
+// list that is there, and the reference distinguishes the two in its reply.
+func (db *DB) LPop(key []byte, count int, front bool) ([][]byte, bool, error) {
 	s := db.lockKey(key)
 	defer db.unlockKey(s)
 
 	o, l, err := db.listAt(s, key)
 	if err != nil || l == nil {
-		return nil, err
+		return nil, false, err
 	}
 	out := make([][]byte, 0, count)
 	for i := 0; i < count; i++ {
@@ -521,7 +524,7 @@ func (db *DB) LPop(key []byte, count int, front bool) ([][]byte, error) {
 	if len(out) > 0 {
 		db.finishWrite(s, key, o, l)
 	}
-	return out, nil
+	return out, true, nil
 }
 
 // LLen returns the element count.

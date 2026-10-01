@@ -317,3 +317,20 @@ standard library. `stretchr/testify` is not used; the tests use the standard
 library. The Prometheus client library is approved by ADR-015 for the metrics
 endpoint and will be adopted in M6, when there are histograms to justify it;
 until then `/metrics` writes the exposition format directly.
+
+## Differential testing against the reference
+
+`difftest` runs the same randomized command stream against Kestrel and a
+real `redis-server`, and compares the replies. It needs `redis-server` on
+PATH and is off by default:
+
+```
+DIFFTEST=1 go test ./difftest/
+DIFFTEST=1 DIFFTEST_ROUNDS=50000 go test ./difftest/ -v
+DIFFTEST=1 DIFFTEST_SEED=12345 go test ./difftest/ -v    # reproduce a failure
+```
+
+Not every difference is a bug: `INCRBYFLOAT` is a documented precision
+deviation, `ZRANGEBYLEX` is undefined over mixed scores, and a TTL
+comparison can turn on a millisecond. The test says which is which, in
+`diff_test.go`, rather than leaving it to be guessed from a failure.
