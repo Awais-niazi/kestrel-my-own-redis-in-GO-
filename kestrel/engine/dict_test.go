@@ -787,3 +787,44 @@ func liveHeapBytes() uint64 {
 	runtime.ReadMemStats(&m)
 	return m.HeapAlloc
 }
+
+// TestRehashStalls shows why the background cycle has to exist.
+//
+// A rehash only advances on set and delete. A burst of writes that stops
+// just after one begins therefore leaves it suspended: both tables stay
+// allocated, so the keys cost roughly half as much again, and every lookup
+// probes two tables instead of one. Nothing in the read path will ever
+// finish it.
+func TestRehashStalls(t *testing.T) {
+	d := newDict()
+	// Write until a rehash starts, then stop, as a load that fills a cache
+	// and then serves it does.
+	i := 0
+	for !(d.rehashing() && d.tab[0].size() >= 32768) {
+		k := fmt.Sprintf("key%d", i)
+		dictSet(d, k, obj(k))
+		i++
+		if i > 1_000_000 {
+			t.Fatal("no rehash started at a size worth measuring")
+		}
+	}
+	stalled := d.overhead()
+
+	for j := 0; j < 200000; j++ {
+		dictGet(d, fmt.Sprintf("key%d", j%i))
+	}
+	if !d.rehashing() {
+		t.Fatal("reads finished the rehash; this test no longer describes the code")
+	}
+
+	// Both tables are allocated and will stay that way.
+	finishRehash(d)
+	settled := d.overhead()
+	t.Logf("%d keys: suspended rehash costs %d bytes, finished costs %d, "+
+		"%.0f%% more while it waits", d.len(), stalled, settled,
+		100*(float64(stalled)/float64(settled)-1))
+	if stalled <= settled {
+		t.Errorf("a suspended rehash cost %d bytes and a finished one %d; "+
+			"it should cost more, having two tables", stalled, settled)
+	}
+}

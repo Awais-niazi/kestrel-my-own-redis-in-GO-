@@ -3,14 +3,9 @@ package engine
 import "time"
 
 // Expiration has two mechanisms (ADR-007): lazy, where any access to a key
-// checks its expiry first (see DB.lookup), and active, where a bounded
-// background cycle samples the TTL index and reaps what it finds.
-//
-// The active cycle exists because lazily expiring a key that is never read
-// again would leak its memory forever. Its cost is bounded rather than
-// exact: expiry is approximate by design, and a hard guarantee would require
-// either a timer per key or a global priority queue, both of which trade the
-// leak for a latency cliff.
+// checks its expiry first (see DB.peek and DB.lookup), and active, where a
+// bounded background cycle samples the TTL index and reaps what it finds.
+// That cycle is backgroundCycle, which also finishes table rehashes.
 
 // expired reports whether o is past due.
 func (ks *Keyspace) expired(o *Object) bool {
@@ -146,13 +141,21 @@ func (db *DB) ExpireTime(key []byte) int64 {
 	return o.ExpireAt
 }
 
-// activeExpireCycle is the bounded background reaper.
+// backgroundCycle is the keyspace's single housekeeping goroutine.
 //
-// It runs on a fixed window and spends at most ActiveExpireCPUPercent of that
-// window doing work, so it can never starve command execution. Timing uses
+// It runs on a fixed window and spends at most ActiveExpireCPUPercent of
+// that window working, so it can never starve command execution. Timing uses
 // the monotonic clock (NFR-6); only the expiry comparison itself uses wall
 // time.
-func (ks *Keyspace) activeExpireCycle() {
+//
+// It does two jobs. The reaper exists because lazily expiring a key that is
+// never read again would leak its memory forever; its cost is bounded rather
+// than exact, since a hard guarantee would need either a timer per key or a
+// global priority queue, both of which trade the leak for a latency cliff.
+// The rehasher exists because a table rehash only advances on writes, so a
+// burst that fills a cache and then stops serving writes leaves one
+// suspended indefinitely -- see RehashPass.
+func (ks *Keyspace) backgroundCycle() {
 	defer ks.wg.Done()
 
 	const window = 100 * time.Millisecond
@@ -165,15 +168,67 @@ func (ks *Keyspace) activeExpireCycle() {
 		case <-ks.stop:
 			return
 		case <-ticker.C:
-			// Replicas never expire on their own clock (FR-3.4), and a
-			// keyspace being loaded from a log expires nothing at all
-			// (Keyspace.SetLoading).
-			if ks.IsReplica() || ks.IsLoading() {
+			// Unconditional: a replica and a keyspace being loaded have
+			// tables to settle like any other, and neither rehashing nor
+			// its absence is observable to a client.
+			ks.RehashPass(time.Now().Add(budget))
+
+			// Replicas never expire on their own clock (FR-3.4), a keyspace
+			// being loaded from a log expires nothing at all
+			// (Keyspace.SetLoading), and the reaper can be switched off.
+			if !ks.opts.ActiveExpire || ks.IsReplica() || ks.IsLoading() {
 				continue
 			}
 			ks.ExpirePass(time.Now().Add(budget))
 		}
 	}
+}
+
+// rehashBatchBuckets is how many buckets one pass moves before releasing the
+// shard. Small enough that a command waits behind a batch rather than behind
+// a table; large enough that the lock is not taken thousands of times for
+// nothing.
+const rehashBatchBuckets = 128
+
+// RehashPass advances any table rehash that command traffic left unfinished,
+// until nothing is left to do or the deadline passes. It returns the number
+// of batches it moved, and is exported so tests can drive it deterministically.
+//
+// A rehash steps on set and delete, which is enough while writes keep
+// coming. A load that fills a keyspace and then serves reads from it stops
+// stepping partway through, and nothing in the read path will ever finish
+// the job: both tables stay allocated, which measured 56% more memory than
+// the settled table, and every lookup probes two tables rather than one.
+//
+// Reads deliberately do not step it. The reference implementation rehashes
+// on lookup too, which fixes this at the cost of putting the work on the
+// hottest path in the server; doing it here keeps that path as it is and
+// bounds the work besides.
+func (ks *Keyspace) RehashPass(deadline time.Time) int {
+	batches := 0
+	for _, db := range ks.dbs {
+		for _, s := range db.shards {
+			for {
+				// The shard is released between batches so a command waits
+				// for one batch at most. No propagation lock is needed:
+				// moving a key between tables changes nothing a client or
+				// the log can observe.
+				ks.barrier.RLock()
+				s.mu.Lock()
+				more := s.dict.rehashSome(rehashBatchBuckets)
+				s.mu.Unlock()
+				ks.barrier.RUnlock()
+				if !more {
+					break
+				}
+				batches++
+				if time.Now().After(deadline) {
+					return batches
+				}
+			}
+		}
+	}
+	return batches
 }
 
 // ExpirePass reaps expired keys until nothing is left to do or the deadline

@@ -1754,3 +1754,64 @@ key present throughout comes back when the tables are pushed through a grow
 and a shrink mid-iteration, that a cursor a client invented terminates, and
 that `COUNT` holds at one, four and sixty-four shards -- one shard being the
 case where the cursor has no shard bits at all.
+
+---
+
+## 29. A rehash that nobody finished
+
+Chunk 1 gave the table an incremental rehash and a `rehashSome` for "the
+background cycle to call". Nothing called it. The method sat unreferenced
+through two chunks, and the gap it left is not cosmetic.
+
+A rehash advances one bucket per `set` and per `delete`. That is ample while
+writes keep arriving. It is nothing at all for the shape of load a cache
+actually has: fill the keyspace, then serve reads from it. The writes stop
+partway through a rehash and the table stays suspended forever, because
+**reads deliberately do not step it.**
+
+Suspended is expensive. Measured on 32,769 keys:
+
+| | bytes |
+|---|---|
+| mid-rehash | 3,612,672 |
+| settled | 2,318,336 |
+
+**56% more memory, held indefinitely**, and every lookup probes two tables
+instead of one for as long as it lasts. At the keyspace level, settling four
+shards took the estimate from 8,167,482 to 6,725,690 bytes.
+
+### Why not simply rehash on reads
+
+The reference implementation does exactly that, and it is the obvious fix.
+It also puts the work on the hottest path in the server, on a branch that is
+taken for the whole duration of every rehash, in exchange for finishing
+something that is not urgent. The background cycle keeps the read path as it
+is and bounds the work besides, which is the better trade here.
+
+The pass releases the shard between batches of 128 buckets, so a command
+waits behind a batch rather than behind a table. It needs no propagation
+lock: moving a key from one table to the other changes nothing a client or
+the log can observe.
+
+### The cycle is no longer about expiry
+
+`activeExpireCycle` only ran when `active-expire` was on, which is correct
+for a reaper and wrong for a rehasher -- a keyspace with the reaper switched
+off still has tables to settle, and so does a replica, and so does one being
+loaded from a log. It is now `backgroundCycle`, started unconditionally,
+with the reaper still gated inside it.
+
+### The TTL index stays a Go map, deliberately
+
+The obvious companion change was to make `shard.expires` a dict too, so the
+expiry cycle and the volatile eviction policies sample through `randomEntry`
+rather than through a map range. It was not made.
+
+It would cost about nineteen bytes for every key carrying a TTL and buy
+nothing a client can see. What those callers need from a range is a varied
+starting point, which the runtime provides. And the dependence is weaker
+than it looks: if map iteration ever stopped being randomised, both callers
+would still make progress, because what they sample they then remove. They
+would re-examine keys rather than fail to reach them.
+
+**Tidiness is not a reason to spend memory in a data store.**

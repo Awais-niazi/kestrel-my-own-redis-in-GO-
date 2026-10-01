@@ -873,3 +873,90 @@ func TestScanTerminatesFromAnyCursor(t *testing.T) {
 		}
 	}
 }
+
+// TestRehashPassSettlesTheTables is the other half of TestRehashStalls: the
+// background cycle finishes what command traffic left suspended.
+func TestRehashPassSettlesTheTables(t *testing.T) {
+	ks := keyspaceWithShards(t, 4)
+	db := ks.DB(0)
+	for i := 0; i < 50000; i++ {
+		mustSet(t, db, fmt.Sprintf("key:%d", i), "v")
+	}
+
+	before := ks.MemoryEstimate()
+	rehashing := 0
+	db.lockAll()
+	for _, s := range db.shards {
+		if s.dict.rehashing() {
+			rehashing++
+		}
+	}
+	db.unlockAll()
+
+	// Run passes until there is nothing left to move.
+	for i := 0; ; i++ {
+		if ks.RehashPass(time.Now().Add(time.Second)) == 0 {
+			break
+		}
+		if i > 10000 {
+			t.Fatal("RehashPass never ran out of work")
+		}
+	}
+
+	db.lockAll()
+	for _, s := range db.shards {
+		if s.dict.rehashing() {
+			db.unlockAll()
+			t.Fatal("a shard is still rehashing after the pass reported no work")
+		}
+	}
+	db.unlockAll()
+
+	after := ks.MemoryEstimate()
+	t.Logf("%d shards were mid-rehash; estimate %d -> %d after settling", rehashing, before, after)
+	if after > before {
+		t.Errorf("settling the tables raised the estimate from %d to %d", before, after)
+	}
+
+	// Nothing may have been lost on the way.
+	if got := db.Size(); got != 50000 {
+		t.Fatalf("the database holds %d keys after rehashing, want 50000", got)
+	}
+	for i := 0; i < 50000; i += 97 {
+		k := fmt.Sprintf("key:%d", i)
+		if v, ok := getString(t, db, k); !ok || v != "v" {
+			t.Fatalf("%q reads back as %q/%v after rehashing", k, v, ok)
+		}
+	}
+}
+
+// TestBackgroundCycleRunsWithExpiryOff checks that the cycle is started even
+// when the reaper is switched off, because settling a table is not expiry.
+func TestBackgroundCycleRunsWithExpiryOff(t *testing.T) {
+	opts := DefaultOptions()
+	opts.ActiveExpire = false
+	opts.Shards = 2
+	ks := New(opts)
+	defer ks.Close()
+	db := ks.DB(0)
+
+	for i := 0; i < 20000; i++ {
+		mustSet(t, db, fmt.Sprintf("key:%d", i), "v")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		db.lockAll()
+		busy := false
+		for _, s := range db.shards {
+			busy = busy || s.dict.rehashing()
+		}
+		db.unlockAll()
+		if !busy {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the tables never settled with active expiry off")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

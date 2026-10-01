@@ -189,10 +189,11 @@ func New(opts Options) *Keyspace {
 	if opts.CachedClock {
 		ks.startCachedClock()
 	}
-	if opts.ActiveExpire {
-		ks.wg.Add(1)
-		go ks.activeExpireCycle()
-	}
+	// The background cycle runs whatever the expiry settings are: finishing
+	// a rehash is not expiry, and a keyspace with active expiry switched off
+	// still needs its tables settled.
+	ks.wg.Add(1)
+	go ks.backgroundCycle()
 	return ks
 }
 
@@ -451,6 +452,15 @@ type shard struct {
 	// expires indexes the keys carrying a TTL. It exists so the active
 	// expiry cycle has a small population to sample rather than the whole
 	// dictionary; the authoritative timestamp lives on the Object.
+	//
+	// This one stays a Go map. Making it a dict would let it be sampled
+	// through randomEntry rather than through a map range, which is tidier,
+	// and would cost about nineteen bytes for every key that carries a TTL
+	// -- a bill that buys nothing a client can see. What the sampling needs
+	// from a range is a varied starting point, and the runtime randomises
+	// that. Were it ever to stop, both callers would still make progress,
+	// because what they sample they then remove: they would re-examine
+	// keys, not fail to reach them.
 	expires map[string]struct{}
 	memory  int64 // estimated bytes held by this shard
 
